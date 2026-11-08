@@ -1,0 +1,89 @@
+package tide.future;
+
+import std.lang.Objects;
+
+/**
+ * Result of racing two futures with {@link Select#select(std.task.Future, std.task.Future)}.
+ * Indicates which branch completed first and holds its resolved value.
+ *
+ * @param <A> First future branch value type.
+ * @param <B> Second future branch value type.
+ */
+final class Select2<A, B> {
+    private final boolean firstCompleted;
+    private A? aVal;
+    private B? bVal;
+
+    /**
+     * Constructs a Select2 result holding the branch completion state and winning value.
+     *
+     * @param firstCompleted Whether first future won the race.
+     * @param aVal First branch value, if won.
+     * @param bVal Second branch value, if won.
+     */
+    private Select2(boolean firstCompleted, A? aVal, B? bVal) {
+        this.firstCompleted = firstCompleted;
+        this.aVal = aVal;
+        this.bVal = bVal;
+    }
+
+    /**
+     * Creates a Select2 indicating the first future won the race.
+     *
+     * @param <A> First type.
+     * @param <B> Second type.
+     * @param val Winning first value.
+     * @return Select2 instance.
+     */
+    static <A, B> Select2<A, B> first(A val) {
+        return new Select2<>(true, val, null);
+    }
+
+    /**
+     * Creates a Select2 indicating the second future won the race.
+     *
+     * @param <A> First type.
+     * @param <B> Second type.
+     * @param val Winning second value.
+     * @return Select2 instance.
+     */
+    static <A, B> Select2<A, B> second(B val) {
+        return new Select2<>(false, null, val);
+    }
+
+    /**
+     * Checks whether the first future branch completed first.
+     *
+     * @return {@code true} if first branch won; {@code false} otherwise.
+     */
+    boolean isFirst() {
+        return this.firstCompleted;
+    }
+
+    /**
+     * Checks whether the second future branch completed first.
+     *
+     * @return {@code true} if second branch won; {@code false} otherwise.
+     */
+    boolean isSecond() {
+        return !this.firstCompleted;
+    }
+
+    /**
+     * Takes the winning value if the first future branch completed.
+     *
+     * @return First branch value, or {@code null} if second branch won.
+     */
+    mut A? takeFirst() {
+        return Objects.take(&mut this.aVal);
+    }
+
+    /**
+     * Takes the winning value if the second future branch completed.
+     *
+     * @return Second branch value, or {@code null} if first branch won.
+     */
+    mut B? takeSecond() {
+        return Objects.take(&mut this.bVal);
+    }
+}

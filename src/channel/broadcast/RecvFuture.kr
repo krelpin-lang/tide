@@ -1,0 +1,39 @@
+package tide.channel.broadcast;
+
+import std.lang.Cloneable;
+import std.task.Context;
+import std.task.Future;
+import std.task.Poll;
+
+/**
+ * Future returned by {@link Receiver#receive()}, completing when a new broadcast
+ * message is delivered to this subscriber.
+ *
+ * @param <T> Transferred message type.
+ */
+final class RecvFuture<T extends Cloneable<T>> borrows channel implements Future<T> {
+    private final &Broadcast<T> channel;
+    private final int subId;
+
+    /**
+     * Constructs a RecvFuture borrowing the parent broadcast channel for the specified subscriber.
+     *
+     * @param channel Parent broadcast channel.
+     * @param subId Subscriber identifier.
+     */
+    RecvFuture(&Broadcast<T> channel, int subId) keeps channel {
+        this.channel = channel;
+        this.subId = subId;
+    }
+
+    /**
+     * Polls for the next message for this subscriber.
+     *
+     * @param cx Task polling context.
+     * @return {@code Poll.Ready} with message when available; {@code Poll.Pending} otherwise.
+     */
+    @Override
+    mut Poll<T> poll(&mut Context cx) {
+        return this.channel.pollReceive(this.subId, cx.waker());
+    }
+}

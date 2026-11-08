@@ -1,0 +1,87 @@
+package examples;
+
+import std.io.IOException;
+import std.lang.Console;
+import std.task.Unit;
+import std.time.Duration;
+import tide.Tide;
+import tide.future.Select2;
+import tide.net.TcpListener;
+import tide.net.TcpStream;
+
+/**
+ * Client select racing and timeout fallback example.
+ */
+final class ClientSelect {
+    /**
+     * Prevents direct instantiation of this client select class.
+     */
+    private ClientSelect() {}
+
+    /**
+     * Entry point for running the client select example.
+     *
+     * @throws Exception If client select execution fails.
+     */
+    static void runExample() throws Exception {
+        Tide.blockOn(ClientSelect.run());
+    }
+
+    /**
+     * Runs client connect and race with timeout.
+     *
+     * @throws Exception If socket or timing operation fails.
+     */
+    static async void run() throws Exception {
+        TcpListener listener = TcpListener.bind("127.0.0.1:0");
+        String addr = listener.localAddr().toString();
+        Tide.spawn(ClientSelect.echoDelayed(listener));
+
+        TcpStream stream = await TcpStream.connect(addr);
+        await stream.writeText("ping-select\n");
+
+        Select2<String?, Unit> result = await Tide.select(
+            stream.readLine(),
+            ClientSelect.timeoutFallback(Duration.ofMillis(500L))
+        );
+
+        if (result.isFirst()) {
+            String? reply = result.takeFirst() ?: null;
+            Console.println("Received server response: $reply");
+        } else {
+            Console.println("Request timed out");
+        }
+
+        stream.close();
+    }
+
+    /**
+     * Helper server task that responds to one client request after a brief delay.
+     *
+     * @param listener Bound TCP listener.
+     * @return Unit upon echo completion.
+     * @throws Exception If socket operation fails.
+     */
+    private static async Unit echoDelayed(TcpListener listener) throws Exception {
+        TcpStream stream = await listener.accept();
+        String? line = await stream.readLine();
+        await Tide.sleepMillis(50L);
+        if (line != null) {
+            await stream.writeText("echo: $line\n");
+        }
+        stream.close();
+        listener.close();
+        return new Unit();
+    }
+
+    /**
+     * Fallback timer branch used in the race.
+     *
+     * @param duration Sleep duration.
+     * @return Unit upon timer expiration.
+     */
+    private static async Unit timeoutFallback(Duration duration) {
+        await Tide.sleep(duration);
+        return new Unit();
+    }
+}

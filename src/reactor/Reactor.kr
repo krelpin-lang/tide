@@ -1,0 +1,478 @@
+package tide.reactor;
+
+import std.io.IOException;
+import std.lang.Objects;
+import std.net.Poller;
+import std.net.TcpListener;
+import std.net.TcpStream;
+import std.net.UdpSocket;
+import std.task.Waker;
+import std.util.ArrayList;
+import std.util.HashMap;
+import std.util.List;
+import std.util.Map;
+
+/**
+ * Event demultiplexer driving non-blocking I/O readiness on top of {@link Poller} (kqueue / epoll).
+ * Coordinates read/write wakers and dispatches readiness events across worker threads.
+ */
+final class Reactor {
+    private static final int WAKE_TOKEN = 1;
+
+    private Poller poller;
+    private TcpStream? wakeReader;
+    private int nextToken;
+    private final Map<int, Entry> entries;
+
+    /**
+     * Constructs a Reactor with the given poller and inter-thread wake stream.
+     *
+     * @param poller OS event demultiplexer.
+     * @param wakeReader Read side of the reactor wake pipe.
+     */
+    private Reactor(Poller poller, TcpStream wakeReader) {
+        this.poller = poller;
+        this.wakeReader = wakeReader;
+        this.nextToken = 2;
+        this.entries = new HashMap<>();
+    }
+
+    /**
+     * Factory method creating a reactor with an associated wake pipe.
+     *
+     * @param poller OS event demultiplexer.
+     * @param wakeReader Read side of wake stream.
+     * @return Initialized Reactor instance.
+     * @throws IOException If configuring or registering the wake stream fails.
+     */
+    static Reactor createWithReader(Poller poller, TcpStream wakeReader) throws IOException {
+        wakeReader.setNonBlocking(true);
+        wakeReader.register(&mut poller, Reactor.WAKE_TOKEN, Poller.Interest.READABLE);
+        return new Reactor(poller, wakeReader);
+    }
+
+    /**
+     * Registers a non-blocking TCP listener for incoming connection readiness.
+     *
+     * @param listener Network listener socket.
+     * @return Assigned unique registration token.
+     * @throws IOException If registering with the poller fails.
+     */
+    mut int registerListener(&mut TcpListener listener) throws IOException {
+        int token = this.nextToken++;
+        listener.setNonBlocking(true);
+        listener.register(&mut this.poller, token, Poller.Interest.READABLE);
+        this.entries.put(token, new Entry(token));
+        return token;
+    }
+
+    /**
+     * Registers a non-blocking TCP stream with the specified event interest.
+     *
+     * @param stream Network TCP stream.
+     * @param interest Poller interest mask (read/write).
+     * @return Assigned unique registration token.
+     * @throws IOException If registering with the poller fails.
+     */
+    mut int registerStream(&mut TcpStream stream, Poller.Interest interest) throws IOException {
+        int token = this.nextToken++;
+        stream.setNonBlocking(true);
+        stream.register(&mut this.poller, token, interest);
+        this.entries.put(token, new Entry(token));
+        return token;
+    }
+
+    /**
+     * Reregisters an existing stream with updated event interest.
+     *
+     * @param stream Network TCP stream.
+     * @param token Registration token.
+     * @param interest Updated interest mask.
+     * @throws IOException If updating poller registration fails.
+     */
+    mut void reregisterStream(&mut TcpStream stream, int token, Poller.Interest interest) throws IOException {
+        stream.reregister(&mut this.poller, token, interest);
+    }
+
+    /**
+     * Deregisters a TCP stream from the reactor and removes its tracking entry.
+     *
+     * @param stream Network TCP stream.
+     * @param token Registration token.
+     * @throws IOException If deregistering from poller fails.
+     */
+    mut void deregisterStream(&mut TcpStream stream, int token) throws IOException {
+        this.entries.remove(&token);
+        stream.deregister(&mut this.poller);
+    }
+
+    /**
+     * Deregisters a TCP listener from the reactor.
+     *
+     * @param listener Network listener socket.
+     * @param token Registration token.
+     * @throws IOException If deregistering fails.
+     */
+    mut void deregisterListener(&mut TcpListener listener, int token) throws IOException {
+        this.entries.remove(&token);
+        listener.deregister(&mut this.poller);
+    }
+
+    /**
+     * Registers a UDP socket with the reactor.
+     *
+     * @param socket UDP datagram socket.
+     * @param interest Interest mask.
+     * @return Assigned unique registration token.
+     * @throws IOException If registering fails.
+     */
+    mut int registerUdp(&mut UdpSocket socket, Poller.Interest interest) throws IOException {
+        int token = this.nextToken++;
+        socket.setNonBlocking(true);
+        socket.register(&mut this.poller, token, interest);
+        this.entries.put(token, new Entry(token));
+        return token;
+    }
+
+    /**
+     * Deregisters a UDP socket from the reactor.
+     *
+     * @param socket UDP datagram socket.
+     * @param token Registration token.
+     * @throws IOException If deregistering fails.
+     */
+    mut void deregisterUdp(&mut UdpSocket socket, int token) throws IOException {
+        this.entries.remove(&token);
+        socket.deregister(&mut this.poller);
+    }
+
+    /**
+     * Sets the waker to notify when the descriptor becomes readable.
+     *
+     * @param token Descriptor token.
+     * @param waker Task waker.
+     */
+    mut void readWaker(int token, Waker waker) {
+        (&mut Entry)? entry = this.entries.getMut(&token);
+        if (entry != null) {
+            entry.readWaker(waker);
+        }
+    }
+
+    /**
+     * Sets the waker to notify when the descriptor becomes writable.
+     *
+     * @param token Descriptor token.
+     * @param waker Task waker.
+     */
+    mut void writeWaker(int token, Waker waker) {
+        (&mut Entry)? entry = this.entries.getMut(&token);
+        if (entry != null) {
+            entry.writeWaker(waker);
+        }
+    }
+
+    /**
+     * Checks if the descriptor with the given token is flagged readable.
+     *
+     * @param token Descriptor token.
+     * @return {@code true} if readable; {@code false} otherwise.
+     */
+    boolean isReadable(int token) {
+        (&Entry)? entry = this.entries.get(&token);
+        return entry != null && entry.readable();
+    }
+
+    /**
+     * Checks if the descriptor with the given token is flagged writable.
+     *
+     * @param token Descriptor token.
+     * @return {@code true} if writable; {@code false} otherwise.
+     */
+    boolean isWritable(int token) {
+        (&Entry)? entry = this.entries.get(&token);
+        return entry != null && entry.writable();
+    }
+
+    /**
+     * Checks if the remote peer closed connection on this descriptor.
+     *
+     * @param token Descriptor token.
+     * @return {@code true} if closed; {@code false} otherwise.
+     */
+    boolean isClosed(int token) {
+        (&Entry)? entry = this.entries.get(&token);
+        return entry != null && entry.closed();
+    }
+
+    /**
+     * Checks if an error occurred on this descriptor.
+     *
+     * @param token Descriptor token.
+     * @return {@code true} if in error state; {@code false} otherwise.
+     */
+    boolean isError(int token) {
+        (&Entry)? entry = this.entries.get(&token);
+        return entry != null && entry.error();
+    }
+
+    /**
+     * Clears the readable flag for the given descriptor token.
+     *
+     * @param token Descriptor token.
+     */
+    mut void clearReadable(int token) {
+        (&mut Entry)? entry = this.entries.getMut(&token);
+        if (entry != null) {
+            entry.clearReadable();
+        }
+    }
+
+    /**
+     * Clears the writable flag for the given descriptor token.
+     *
+     * @param token Descriptor token.
+     */
+    mut void clearWritable(int token) {
+        (&mut Entry)? entry = this.entries.getMut(&token);
+        if (entry != null) {
+            entry.clearWritable();
+        }
+    }
+
+    /**
+     * Polls the OS for pending I/O events up to the specified timeout in milliseconds.
+     *
+     * @param timeoutMillis Maximum time to wait.
+     * @return List of task wakers ready to be awakened.
+     * @throws IOException If polling the OS fails.
+     */
+    mut List<Waker> poll(long timeoutMillis) throws IOException {
+        List<Waker> ready = new ArrayList<>();
+        List<Poller.Event> events = this.poller.poll(timeoutMillis);
+        for (&Poller.Event event : &events) {
+            int token = event.token();
+            if (token == Reactor.WAKE_TOKEN) {
+                this.wakeReader?.tryRead(128);
+                continue;
+            }
+            (&mut Entry)? entry = this.entries.getMut(&token);
+            if (entry == null) {
+                continue;
+            }
+            if (event.readable()) {
+                entry.markReadable();
+                Waker? w = entry.takeReadWaker();
+                if (w != null) {
+                    ready.add(w);
+                }
+            }
+            if (event.writable()) {
+                entry.markWritable();
+                Waker? w = entry.takeWriteWaker();
+                if (w != null) {
+                    ready.add(w);
+                }
+            }
+            if (event.closed()) {
+                entry.markClosed();
+                Waker? w = entry.takeReadWaker();
+                if (w != null) {
+                    ready.add(w);
+                }
+            }
+            if (event.error()) {
+                entry.markError();
+                Waker? w = entry.takeReadWaker();
+                if (w != null) {
+                    ready.add(w);
+                }
+            }
+        }
+        return ready;
+    }
+
+    /**
+     * Closes the reactor and releases the wake pipe.
+     */
+    mut void close() {
+        TcpStream? reader = Objects.take(&mut this.wakeReader);
+        if (reader != null) {
+            try {
+                reader.deregister(&mut this.poller);
+            } catch (IOException e) {}
+        }
+        this.entries.clear();
+    }
+
+    /**
+     * State tracking entry for a registered descriptor token in the reactor.
+     */
+    static final class Entry {
+        private final int token;
+        private Waker? readWaker;
+        private Waker? writeWaker;
+        private boolean readable;
+        private boolean writable;
+        private boolean closed;
+        private boolean error;
+
+        /**
+         * Constructs an entry for tracking readiness of the given token.
+         *
+         * @param token Descriptor token.
+         */
+        Entry(int token) {
+            this.token = token;
+            this.readWaker = null;
+            this.writeWaker = null;
+            this.readable = false;
+            this.writable = false;
+            this.closed = false;
+            this.error = false;
+        }
+
+        /**
+         * Returns the descriptor token.
+         *
+         * @return Token integer.
+         */
+        int token() {
+            return this.token;
+        }
+
+        /**
+         * Returns whether the descriptor is readable.
+         *
+         * @return {@code true} if readable.
+         */
+        boolean readable() {
+            return this.readable;
+        }
+
+        /**
+         * Returns whether the descriptor is writable.
+         *
+         * @return {@code true} if writable.
+         */
+        boolean writable() {
+            return this.writable;
+        }
+
+        /**
+         * Returns whether the descriptor connection was closed by peer.
+         *
+         * @return {@code true} if closed.
+         */
+        boolean closed() {
+            return this.closed;
+        }
+
+        /**
+         * Returns whether an error occurred on the descriptor.
+         *
+         * @return {@code true} if in error state.
+         */
+        boolean error() {
+            return this.error;
+        }
+
+        /**
+         * Marks the entry as readable.
+         */
+        mut void markReadable() {
+            this.readable = true;
+        }
+
+        /**
+         * Marks the entry as writable.
+         */
+        mut void markWritable() {
+            this.writable = true;
+        }
+
+        /**
+         * Marks the entry as closed.
+         */
+        mut void markClosed() {
+            this.closed = true;
+        }
+
+        /**
+         * Marks the entry as in error state.
+         */
+        mut void markError() {
+            this.error = true;
+        }
+
+        /**
+         * Clears the readable readiness flag.
+         */
+        mut void clearReadable() {
+            this.readable = false;
+        }
+
+        /**
+         * Clears the writable readiness flag.
+         */
+        mut void clearWritable() {
+            this.writable = false;
+        }
+
+        /**
+         * Sets the read waker for this entry.
+         *
+         * @param waker Task waker.
+         */
+        mut void readWaker(Waker waker) {
+            this.readWaker = waker;
+        }
+
+        /**
+         * Sets the write waker for this entry.
+         *
+         * @param waker Task waker.
+         */
+        mut void writeWaker(Waker waker) {
+            this.writeWaker = waker;
+        }
+
+        /**
+         * Takes and clears the registered read waker.
+         *
+         * @return Registered waker, or {@code null}.
+         */
+        mut Waker? takeReadWaker() {
+            return Objects.take(&mut this.readWaker);
+        }
+
+        /**
+         * Takes and clears the registered write waker.
+         *
+         * @return Registered waker, or {@code null}.
+         */
+        mut Waker? takeWriteWaker() {
+            return Objects.take(&mut this.writeWaker);
+        }
+
+        /**
+         * Awakens the read waker if present.
+         */
+        mut void wakeRead() {
+            Waker? waker = Objects.take(&mut this.readWaker);
+            if (waker != null) {
+                waker.wake();
+            }
+        }
+
+        /**
+         * Awakens the write waker if present.
+         */
+        mut void wakeWrite() {
+            Waker? waker = Objects.take(&mut this.writeWaker);
+            if (waker != null) {
+                waker.wake();
+            }
+        }
+    }
+}

@@ -1,0 +1,123 @@
+package tide.channel.oneshot;
+
+import std.io.IOException;
+import std.lang.Objects;
+import std.task.Poll;
+import std.task.Waker;
+import std.util.ArrayList;
+import std.util.List;
+
+/**
+ * A one-shot asynchronous channel for transmitting a single value between two tasks.
+ * Once sent or closed, subsequent send calls fail.
+ *
+ * @param <T> Transferred value type.
+ */
+final class Oneshot<T> {
+    private final std.sync.Mutex<State<T>> inner;
+
+    /**
+     * Internal state container for the oneshot channel.
+     *
+     * @param <T> Transferred value type.
+     */
+    private static final class State<T> {
+        List<T> item;
+        boolean closed;
+        Waker? waiter;
+
+        /**
+         * Constructs an empty initial oneshot state.
+         */
+        State() {
+            this.item = new ArrayList<>();
+            this.closed = false;
+            this.waiter = null;
+        }
+    }
+
+    /**
+     * Constructs a new Oneshot channel.
+     */
+    Oneshot() {
+        this.inner = new std.sync.Mutex<>(new State<>());
+    }
+
+    /**
+     * Borrows the sending handle for this channel.
+     *
+     * @return Sender instance.
+     */
+    Sender<T> sender() borrows this {
+        return new Sender<>(this);
+    }
+
+    /**
+     * Borrows the receiving handle for this channel.
+     *
+     * @return Receiver instance implementing {@link std.task.Future}.
+     */
+    Receiver<T> receiver() borrows this {
+        return new Receiver<>(this);
+    }
+
+    /**
+     * Sends the single value across the channel.
+     *
+     * @param val Value to transmit.
+     * @return {@code true} if successfully delivered; {@code false} if already closed or sent.
+     */
+    boolean send(T val) {
+        Waker? toWake = null;
+        {
+            std.sync.Mutex.Guard<State<T>> guard = this.inner.lock();
+            &mut State<T> s = guard.getMut();
+            if (s.closed || s.item.size() > 0) {
+                return false;
+            }
+            s.item.add(val);
+            toWake = Objects.take(&mut s.waiter);
+        }
+        if (toWake != null) {
+            toWake.wake();
+        }
+        return true;
+    }
+
+    /**
+     * Closes the channel without sending a value.
+     */
+    void close() {
+        Waker? toWake = null;
+        {
+            std.sync.Mutex.Guard<State<T>> guard = this.inner.lock();
+            &mut State<T> s = guard.getMut();
+            s.closed = true;
+            toWake = Objects.take(&mut s.waiter);
+        }
+        if (toWake != null) {
+            toWake.wake();
+        }
+    }
+
+    /**
+     * Polls for the transmitted value, registering the caller's waker if pending.
+     *
+     * @param waker Task waker to awaken when the value is delivered.
+     * @return Ready with delivered value, or Pending.
+     * @throws IOException If the channel closed before sending.
+     */
+    Poll<T> pollReceive(&Waker waker) borrows this throws IOException {
+        std.sync.Mutex.Guard<State<T>> guard = this.inner.lock();
+        &mut State<T> s = guard.getMut();
+        if (s.item.size() > 0) {
+            T val = s.item.remove(0);
+            return Poll.Ready(val);
+        }
+        if (s.closed) {
+            throw new IOException("oneshot channel closed before receiving value");
+        }
+        s.waiter = waker.copy();
+        return Poll.Pending;
+    }
+}

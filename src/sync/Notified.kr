@@ -1,0 +1,35 @@
+package tide.sync;
+
+import std.task.Context;
+import std.task.Future;
+import std.task.Poll;
+import std.task.Unit;
+
+/**
+ * Future returned by {@link Notify#notified()}, resolving to {@link Unit} when notified.
+ */
+final class Notified borrows notify implements Future<Unit> {
+    private final &Notify notify;
+    private boolean registered;
+
+    /**
+     * Constructs a Notified future borrowing the parent Notify primitive.
+     *
+     * @param notify Parent notify instance.
+     */
+    Notified(&Notify notify) keeps notify {
+        this.notify = notify;
+        this.registered = false;
+    }
+
+    /**
+     * Polls for notification arrival.
+     *
+     * @param cx Task polling context.
+     * @return {@code Poll.Ready} if notified; {@code Poll.Pending} otherwise.
+     */
+    @Override
+    mut Poll<Unit> poll(&mut Context cx) {
+        return this.notify.pollNotified(&mut this.registered, cx.waker());
+    }
+}

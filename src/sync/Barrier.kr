@@ -1,0 +1,94 @@
+package tide.sync;
+
+import std.lang.Objects;
+import std.task.Poll;
+import std.task.Waker;
+import std.util.ArrayList;
+import std.util.List;
+
+/**
+ * An asynchronous synchronization barrier enabling a fixed number of tasks to wait
+ * until all participating tasks have reached the barrier before any continue.
+ * Reusable across multiple successive generations.
+ */
+final class Barrier {
+    private final int total;
+    private final std.sync.Mutex<State> inner;
+
+    /**
+     * Internal state tracking arrived participant count, current generation, and wakers.
+     */
+    private static final class State {
+        int count;
+        int generation;
+        List<Waker> waiters;
+
+        /**
+         * Constructs initial empty barrier state at generation 0.
+         */
+        State() {
+            this.count = 0;
+            this.generation = 0;
+            this.waiters = new ArrayList<>();
+        }
+    }
+
+    /**
+     * Constructs a Barrier requiring {@code total} tasks to synchronize.
+     *
+     * @param total Number of participating tasks.
+     */
+    Barrier(int total) {
+        this.total = total;
+        this.inner = new std.sync.Mutex<>(new State());
+    }
+
+    /**
+     * Asynchronously awaits the arrival of all participants at the barrier.
+     *
+     * @return BarrierFuture resolving to a {@link BarrierWaitResult}.
+     */
+    BarrierFuture wait() borrows this {
+        return new BarrierFuture(this);
+    }
+
+    /**
+     * Polls whether all participants have arrived at the barrier.
+     *
+     * @param myGen Registered barrier generation index.
+     * @param waker Task waker to awaken once all participants arrive.
+     * @return Ready with BarrierWaitResult if generation completed; Pending otherwise.
+     */
+    Poll<BarrierWaitResult> pollWait(&mut int myGen, &Waker waker) borrows this {
+        List<Waker>? toWake = null;
+        boolean leader = false;
+        {
+            std.sync.Mutex.Guard<State> guard = this.inner.lock();
+            &mut State s = guard.getMut();
+            if (myGen == -1) {
+                myGen = s.generation;
+                s.count++;
+                if (s.count == this.total) {
+                    s.generation++;
+                    s.count = 0;
+                    toWake = Objects.replace(&mut s.waiters, new ArrayList<>());
+                    leader = true;
+                } else {
+                    s.waiters.add(waker.copy());
+                    return Poll.Pending;
+                }
+            } else {
+                if (s.generation > myGen) {
+                    return Poll.Ready(new BarrierWaitResult(false));
+                }
+                return Poll.Pending;
+            }
+        }
+        if (toWake != null) {
+            for (int i = 0; i < toWake.size(); i++) {
+                toWake.get(i).wake();
+            }
+        }
+        return Poll.Ready(new BarrierWaitResult(leader));
+    }
+}

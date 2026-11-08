@@ -1,0 +1,37 @@
+package tide.sync;
+
+import std.task.Context;
+import std.task.Future;
+import std.task.Poll;
+
+/**
+ * Future returned by {@link RwLock#read()}, resolving to an {@link RwLockReadGuard} once
+ * shared read access is granted.
+ *
+ * @param <T> Protected data type.
+ */
+final class RwLockReadFuture<T> borrows lock implements Future<RwLockReadGuard<T>> {
+    private final &RwLock<T> lock;
+    private boolean registered;
+
+    /**
+     * Constructs an RwLockReadFuture borrowing the parent RwLock.
+     *
+     * @param lock Parent reader-writer lock.
+     */
+    RwLockReadFuture(&RwLock<T> lock) keeps lock {
+        this.lock = lock;
+        this.registered = false;
+    }
+
+    /**
+     * Polls for shared read lock acquisition.
+     *
+     * @param cx Context with task waker.
+     * @return {@code Poll.Ready} with read guard when acquired; {@code Poll.Pending} otherwise.
+     */
+    @Override
+    mut Poll<RwLockReadGuard<T>> poll(&mut Context cx) {
+        return this.lock.pollRead(&mut this.registered, cx.waker());
+    }
+}

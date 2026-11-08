@@ -1,0 +1,56 @@
+package tide.channel.broadcast;
+
+import std.lang.AutoCloseable;
+import std.lang.Cloneable;
+
+/**
+ * Subscriber receiving handle for a {@link Broadcast} channel.
+ * Automatically unsubscribes when dropped via {@link AutoCloseable}.
+ *
+ * @param <T> Transferred message type.
+ */
+final class Receiver<T extends Cloneable<T>> borrows channel implements AutoCloseable {
+    private final &Broadcast<T> channel;
+    private int subId;
+
+    /**
+     * Constructs a Receiver handle for a specific subscription on the broadcast channel.
+     *
+     * @param channel Parent broadcast channel.
+     * @param subId Assigned subscriber identifier.
+     */
+    Receiver(&Broadcast<T> channel, int subId) keeps channel {
+        this.channel = channel;
+        this.subId = subId;
+    }
+
+    /**
+     * Asynchronously awaits the next broadcast message.
+     *
+     * @return RecvFuture resolving to the broadcast message.
+     */
+    RecvFuture<T> receive() borrows this {
+        return new RecvFuture<>(this.channel, this.subId);
+    }
+
+    /**
+     * Creates an additional independent subscriber to the same broadcast channel.
+     *
+     * @return New Receiver instance.
+     */
+    Receiver<T> copy() borrows this {
+        return this.channel.subscribe();
+    }
+
+    /**
+     * Unsubscribes from the broadcast channel when dropped.
+     */
+    @Override
+    mut void close() {
+        if (this.subId != 0) {
+            int id = this.subId;
+            this.subId = 0;
+            this.channel.unsubscribe(id);
+        }
+    }
+}

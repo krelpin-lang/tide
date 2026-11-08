@@ -1,0 +1,29 @@
+package tide.channel.oneshot;
+
+/**
+ * Sending endpoint of a {@link Oneshot} channel.
+ *
+ * @param <T> Transferred value type.
+ */
+final class Sender<T> borrows channel {
+    private final &Oneshot<T> channel;
+
+    /**
+     * Constructs a Sender borrowing the parent Oneshot channel.
+     *
+     * @param channel Parent oneshot channel.
+     */
+    Sender(&Oneshot<T> channel) keeps channel {
+        this.channel = channel;
+    }
+
+    /**
+     * Sends the single value to the receiver.
+     *
+     * @param val Value to transmit.
+     * @return {@code true} if accepted; {@code false} if already sent or closed.
+     */
+    boolean send(T val) {
+        return this.channel.send(val);
+    }
+}

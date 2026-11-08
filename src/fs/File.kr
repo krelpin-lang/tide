@@ -1,0 +1,140 @@
+package tide.fs;
+
+import std.io.FileReader;
+import std.io.FileWriter;
+import std.io.IOException;
+import std.task.Unit;
+import tide.Tide;
+import tide.io.AsyncRead;
+import tide.io.AsyncWrite;
+import tide.io.Io;
+
+/**
+ * Asynchronous file handle for reading from and writing to disk files.
+ * Offloads underlying blocking file system calls to the dedicated blocking pool.
+ */
+final class File implements AsyncRead, AsyncWrite {
+    private final String path;
+
+    /**
+     * Constructs a File handle for the specified path.
+     *
+     * @param path File system path.
+     */
+    private File(String path) {
+        this.path = path;
+    }
+
+    /**
+     * Asynchronously opens an existing file for reading.
+     *
+     * @param path File system path.
+     * @return File handle.
+     * @throws IOException If file does not exist or cannot be opened.
+     */
+    static async File open(String path) throws IOException {
+        String p = path;
+        try {
+            await Tide.spawnBlocking(() -> {
+                FileReader r = FileReader.open(p);
+                return 0;
+            });
+        } catch (IOException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IOException(e.getMessage() ?: "failed to open file");
+        }
+        return new File(path);
+    }
+
+    /**
+     * Asynchronously creates or truncates a file for writing.
+     *
+     * @param path File system path.
+     * @return File handle.
+     * @throws IOException If file cannot be created.
+     */
+    static async File create(String path) throws IOException {
+        String p = path;
+        try {
+            await Tide.spawnBlocking(() -> {
+                FileWriter w = FileWriter.create(p);
+                return 0;
+            });
+        } catch (IOException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IOException(e.getMessage() ?: "failed to create file");
+        }
+        return new File(path);
+    }
+
+    /**
+     * Returns the file system path of this file.
+     *
+     * @return File path string.
+     */
+    String path() {
+        return this.path;
+    }
+
+    /**
+     * Asynchronously reads up to {@code max} bytes from the file.
+     *
+     * @param max Maximum number of bytes to read.
+     * @return Read bytes.
+     * @throws IOException If read fails.
+     */
+    @Override
+    mut async byte[] read(int max) throws IOException {
+        String p = this.path;
+        int m = max;
+        try {
+            return await Tide.spawnBlocking(() -> {
+                FileReader r = FileReader.open(p);
+                return r.read(m);
+            });
+        } catch (IOException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IOException(e.getMessage() ?: "failed to read file");
+        }
+    }
+
+    /**
+     * Asynchronously appends bytes to the file.
+     *
+     * @param bytes Bytes to write.
+     * @return Number of bytes written.
+     * @throws IOException If write fails.
+     */
+    @Override
+    mut async int write(&byte[] bytes) throws IOException {
+        byte[] copy = new byte[bytes.length];
+        Io.copyBytes(bytes, 0, &mut copy, 0, bytes.length);
+        String p = this.path;
+        try {
+            return await Tide.spawnBlocking(move () -> {
+                FileWriter w = FileWriter.append(p);
+                w.write(&copy);
+                w.flush();
+                return copy.length;
+            });
+        } catch (IOException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IOException(e.getMessage() ?: "failed to write file");
+        }
+    }
+
+    /**
+     * Flushes written data to disk.
+     *
+     * @return Unit upon completion.
+     * @throws IOException If flush fails.
+     */
+    @Override
+    mut async Unit flush() throws IOException {
+        return new Unit();
+    }
+}

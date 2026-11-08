@@ -1,0 +1,73 @@
+package tide.sync;
+
+import std.lang.AutoCloseable;
+
+/**
+ * RAII guard granting exclusive write access to an asynchronous {@link RwLock}.
+ * Automatically releases exclusive write access upon leaving scope.
+ *
+ * @param <T> Protected data type.
+ */
+final class RwLockWriteGuard<T> borrows lock implements AutoCloseable {
+    private final &RwLock<T> lock;
+    private boolean active;
+
+    /**
+     * Constructs an RwLockWriteGuard borrowing the parent RwLock.
+     *
+     * @param lock Parent reader-writer lock.
+     */
+    RwLockWriteGuard(&RwLock<T> lock) keeps lock {
+        this.lock = lock;
+        this.active = true;
+    }
+
+    /**
+     * Automatically invoked when dropped, releasing the exclusive write lock.
+     */
+    @Override
+    mut void close() {
+        if (this.active) {
+            this.active = false;
+            this.lock.unlockWrite();
+        }
+    }
+
+    /**
+     * Explicitly releases the write lock early before leaving scope.
+     */
+    mut void unlockEarly() {
+        if (this.active) {
+            this.active = false;
+            this.lock.unlockWrite();
+        }
+    }
+
+    /**
+     * Mutates the protected value in-place.
+     *
+     * @param action Mutation callback.
+     */
+    mut void modify(RwLock.Action<T> action) {
+        this.lock.modify(action);
+    }
+
+    /**
+     * Replaces the protected value.
+     *
+     * @param val New value.
+     */
+    mut void set(T val) {
+        this.lock.set(val);
+    }
+
+    /**
+     * Inspects or maps the protected value.
+     *
+     * @param func Mapping callback.
+     * @return Computed result.
+     */
+    mut <R> R map(RwLock.Func<T, R> func) {
+        return this.lock.writeMap(func);
+    }
+}

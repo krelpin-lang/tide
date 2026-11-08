@@ -1,0 +1,37 @@
+package tide.sync;
+
+import std.task.Context;
+import std.task.Future;
+import std.task.Poll;
+
+/**
+ * Future returned by {@link Mutex#lock()}, resolving to a {@link MutexGuard} once
+ * exclusive access is granted.
+ *
+ * @param <T> Protected data type.
+ */
+final class LockFuture<T> borrows mutex implements Future<MutexGuard<T>> {
+    private final &Mutex<T> mutex;
+    private boolean registered;
+
+    /**
+     * Constructs a LockFuture borrowing the parent Mutex.
+     *
+     * @param mutex Parent mutex.
+     */
+    LockFuture(&Mutex<T> mutex) keeps mutex {
+        this.mutex = mutex;
+        this.registered = false;
+    }
+
+    /**
+     * Polls for lock acquisition. If locked by another task, registers the current waker.
+     *
+     * @param cx Polling context with task waker.
+     * @return {@code Poll.Ready} with guard when acquired; {@code Poll.Pending} otherwise.
+     */
+    @Override
+    mut Poll<MutexGuard<T>> poll(&mut Context cx) {
+        return this.mutex.pollLock(&mut this.registered, cx.waker());
+    }
+}

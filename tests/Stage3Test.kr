@@ -1,0 +1,214 @@
+package tests;
+
+import std.io.IOException;
+import std.task.Unit;
+import tide.Tide;
+import tide.fs.File;
+import tide.fs.Files;
+import tide.io.AsyncRead;
+import tide.io.AsyncWrite;
+import tide.io.BufReader;
+import tide.io.BufWriter;
+import tide.io.Io;
+import tide.io.Split;
+import tide.net.TcpListener;
+import tide.net.TcpStream;
+import tide.net.UdpSocket;
+import tide.process.Command;
+import tide.runtime.JoinHandle;
+import tide.signal.Signal;
+
+final class Stage3Test {
+    private Stage3Test() {}
+
+    @Test
+    static void testAsyncIoCopyAndExact() throws Exception {
+        Tide.blockOn(Stage3Test.runCopyAndExactTest());
+    }
+
+    private static async void runCopyAndExactTest() throws Exception {
+        TcpListener listener = TcpListener.bind("127.0.0.1:0");
+        String addr = listener.localAddr().toString();
+
+        JoinHandle<Unit> server = Tide.spawn(Stage3Test.serveExactEcho(listener));
+        TcpStream client = await TcpStream.connect(addr);
+
+        byte[] message = "hello-async-io-stream".bytes();
+        await Io.writeAll(&mut client, &message);
+
+        byte[] received = await Io.readExact(&mut client, message.length);
+        String? text = String.fromUtf8(&received);
+        Check.that(text != null && text.equals("hello-async-io-stream"), "exact echo matches");
+
+        await server;
+    }
+
+    private static async Unit serveExactEcho(TcpListener listener) throws Exception {
+        TcpStream stream = await listener.accept();
+        byte[] buf = await Io.readExact(&mut stream, 21);
+        await Io.writeAll(&mut stream, &buf);
+        stream.close();
+        listener.close();
+        return new Unit();
+    }
+
+    @Test
+    static void testBufReaderAndWriter() throws Exception {
+        Tide.blockOn(Stage3Test.runBufReaderTest());
+    }
+
+    private static async void runBufReaderTest() throws Exception {
+        TcpListener listener = TcpListener.bind("127.0.0.1:0");
+        String addr = listener.localAddr().toString();
+
+        JoinHandle<Unit> server = Tide.spawn(Stage3Test.serveLines(listener));
+        TcpStream clientStream = await TcpStream.connect(addr);
+        BufReader<TcpStream> reader = new BufReader<>(clientStream);
+
+        String? line1 = await reader.readLine();
+        Check.that(line1 != null && line1.equals("first-line"), "line 1 matches");
+
+        String? line2 = await reader.readLine();
+        Check.that(line2 != null && line2.equals("second-line"), "line 2 matches");
+
+        await server;
+    }
+
+    private static async Unit serveLines(TcpListener listener) throws Exception {
+        TcpStream stream = await listener.accept();
+        BufWriter<TcpStream> writer = new BufWriter<>(stream);
+        await writer.writeString("first-line\n");
+        await writer.writeString("second-line\n");
+        await writer.flush();
+        listener.close();
+        return new Unit();
+    }
+
+    @Test
+    static void testStreamSplit() throws Exception {
+        Tide.blockOn(Stage3Test.runSplitTest());
+    }
+
+    private static async void runSplitTest() throws Exception {
+        TcpListener listener = TcpListener.bind("127.0.0.1:0");
+        String addr = listener.localAddr().toString();
+
+        JoinHandle<Unit> server = Tide.spawn(Stage3Test.serveSplitEcho(listener));
+        TcpStream client = await TcpStream.connect(addr);
+        Split<TcpStream> split = client.split();
+        Split.ReadHalf<TcpStream> readHalf = split.readHalf();
+        Split.WriteHalf<TcpStream> writeHalf = split.writeHalf();
+
+        byte[] msg = "split-data".bytes();
+        await writeHalf.write(&msg);
+        await writeHalf.flush();
+
+        byte[] received = await readHalf.read(64);
+        String? text = String.fromUtf8(&received);
+        Check.that(text != null && text.equals("split-data"), "split received data");
+
+        await server;
+    }
+
+    private static async Unit serveSplitEcho(TcpListener listener) throws Exception {
+        TcpStream stream = await listener.accept();
+        byte[] bytes = await stream.read(64);
+        await stream.writeAll(&bytes);
+        stream.close();
+        listener.close();
+        return new Unit();
+    }
+
+    @Test
+    static void testAsyncUdp() throws Exception {
+        Tide.blockOn(Stage3Test.runUdpTest());
+    }
+
+    private static async void runUdpTest() throws Exception {
+        UdpSocket server = await UdpSocket.bind("127.0.0.1:0");
+        String serverAddr = server.localAddr().toString();
+
+        UdpSocket client = await UdpSocket.bind("127.0.0.1:0");
+        await client.sendText("udp-ping", serverAddr);
+
+        UdpSocket.Datagram d = await server.receiveFrom(1024);
+        Check.that(d.text().equals("udp-ping"), "udp message received");
+
+        await server.sendText("udp-pong", d.sender().toString());
+        UdpSocket.Datagram reply = await client.receiveFrom(1024);
+        Check.that(reply.text().equals("udp-pong"), "udp reply received");
+
+        server.close();
+        client.close();
+    }
+
+    @Test
+    static void testAsyncFiles() throws Exception {
+        Tide.blockOn(Stage3Test.runFilesTest());
+    }
+
+    private static async void runFilesTest() throws Exception {
+        String testDir = "target/tide-fs-test";
+        await Files.createDirectories(testDir);
+        String testFile = "$testDir/sample.txt";
+
+        await Files.writeString(testFile, "hello-async-files");
+        Check.that(await Files.exists(testFile), "file exists");
+
+        String content = await Files.readString(testFile);
+        Check.that(content.equals("hello-async-files"), "content read back");
+
+        await Files.remove(testFile);
+        Check.that(!await Files.exists(testFile), "file deleted");
+    }
+
+    @Test
+    static void testAsyncFileHandle() throws Exception {
+        Tide.blockOn(Stage3Test.runFileHandleTest());
+    }
+
+    private static async void runFileHandleTest() throws Exception {
+        String testFile = "target/tide-fs-test/handle.txt";
+        File file = await File.create(testFile);
+        byte[] data = "handle-bytes".bytes();
+        await file.write(&data);
+
+        File readFile = await File.open(testFile);
+        byte[] readBack = await readFile.read(64);
+        String? text = String.fromUtf8(&readBack);
+        Check.that(text != null && text.equals("handle-bytes"), "file handle bytes match");
+
+        await Files.remove(testFile);
+    }
+
+    @Test
+    static void testAsyncCommand() throws Exception {
+        Tide.blockOn(Stage3Test.runCommandTest());
+    }
+
+    private static async void runCommandTest() throws Exception {
+        Command cmd = new Command("echo");
+        cmd.arg("hello-tide-process");
+        Command.Output output = await cmd.output();
+        Check.equalInt(output.status(), 0);
+        Check.that(output.stdout().trim().equals("hello-tide-process"), "command stdout matches");
+    }
+
+    @Test
+    static void testSignalCtrlC() throws Exception {
+        Tide.blockOn(Stage3Test.runSignalTest());
+    }
+
+    private static async void runSignalTest() throws Exception {
+        Signal.reset();
+        JoinHandle<Unit> waiter = Tide.spawn(Stage3Test.awaitSignal());
+        await Tide.sleepMillis(10L);
+        Signal.trigger();
+        await waiter;
+    }
+
+    private static async Unit awaitSignal() {
+        await Tide.ctrlC();
+        return new Unit();
+    }
+}

@@ -1,0 +1,147 @@
+package tide.process;
+
+import std.io.IOException;
+import std.util.ArrayList;
+import std.util.List;
+import tide.Tide;
+
+/**
+ * Asynchronous process builder and launcher. Spawns an external operating system process
+ * and collects its exit code, standard output, and standard error without blocking scheduler threads.
+ */
+final class Command {
+    private final String program;
+    private final List<String> arguments;
+    private String? workingDirectory;
+    private final List<String> environment;
+
+    /**
+     * Constructs a Command targeting the given executable program.
+     *
+     * @param program Program name or executable path.
+     */
+    Command(String program) {
+        this.program = program;
+        this.arguments = new ArrayList<>();
+        this.workingDirectory = null;
+        this.environment = new ArrayList<>();
+    }
+
+    /**
+     * Appends an argument to the process command line.
+     *
+     * @param value Argument string.
+     */
+    mut void arg(String value) {
+        this.arguments.add(value);
+    }
+
+    /**
+     * Appends multiple arguments to the command line.
+     *
+     * @param values Variable argument list of strings.
+     */
+    mut void args(String... values) {
+        for (int i = 0; i < values.length; i++) {
+            this.arguments.add(values[i]);
+        }
+    }
+
+    /**
+     * Sets the working directory for child process execution.
+     *
+     * @param path Directory path.
+     */
+    mut void directory(String path) {
+        this.workingDirectory = path;
+    }
+
+    /**
+     * Sets an environment variable key-value pair for the child process.
+     *
+     * @param name Variable name.
+     * @param value Variable value.
+     */
+    mut void env(String name, String value) {
+        this.environment.add("$name=$value");
+    }
+
+    /**
+     * Asynchronously executes the command, waiting for it to exit and capturing all output.
+     *
+     * @return Output record containing status code, stdout text, and stderr text.
+     * @throws IOException If process launch fails.
+     */
+    async Output output() throws IOException {
+        String prog = this.program;
+        List<String> argsList = new ArrayList<>();
+        for (int i = 0; i < this.arguments.size(); i++) {
+            argsList.add(this.arguments.get(i));
+        }
+        String? dir = this.workingDirectory;
+        try {
+            std.process.Command.Output out = await Tide.spawnBlocking(move () -> {
+                std.process.Command cmd = new std.process.Command(prog);
+                for (int i = 0; i < argsList.size(); i++) {
+                    cmd.arg(argsList.get(i));
+                }
+                if (dir != null) {
+                    cmd.directory(dir);
+                }
+                return cmd.output();
+            });
+            return new Output(out.status(), out.stdout(), out.stderr());
+        } catch (IOException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IOException(e.getMessage() ?: "failed to execute command");
+        }
+    }
+
+    /**
+     * Asynchronously executes the command and waits for its exit status code.
+     *
+     * @return Exit status integer (0 typically indicates success).
+     * @throws IOException If execution fails.
+     */
+    async int status() throws IOException {
+        Output out = await this.output();
+        return out.status();
+    }
+
+    /**
+     * Captured process output containing exit code, stdout, and stderr strings.
+     *
+     * @param status Process exit code.
+     * @param stdout Standard output text.
+     * @param stderr Standard error text.
+     */
+    record Output(int status, String stdout, String stderr) {
+        /**
+         * Checks whether the process exited successfully with status 0.
+         *
+         * @return {@code true} if status == 0; {@code false} otherwise.
+         */
+        boolean success() {
+            return this.status == 0;
+        }
+
+        /**
+         * Returns standard output string.
+         *
+         * @return stdout string.
+         */
+        String stdoutText() {
+            return this.stdout;
+        }
+
+        /**
+         * Returns standard error string.
+         *
+         * @return stderr string.
+         */
+        String stderrText() {
+            return this.stderr;
+        }
+    }
+}

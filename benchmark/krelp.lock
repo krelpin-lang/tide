@@ -1,0 +1,7 @@
+# This file is written by krelp. Do not edit it by hand.
+version = 1
+
+[[package]]
+name = "tide"
+version = "0.1.0"
+source = "path+.."

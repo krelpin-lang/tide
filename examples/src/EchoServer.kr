@@ -1,0 +1,65 @@
+package examples;
+
+import std.io.IOException;
+import std.lang.Console;
+import std.net.SocketAddr;
+import std.task.Unit;
+import tide.Tide;
+import tide.net.TcpListener;
+import tide.net.TcpStream;
+
+/**
+ * Asynchronous TCP echo server example.
+ */
+final class EchoServer {
+    /**
+     * Prevents direct instantiation of this echo server class.
+     */
+    private EchoServer() {}
+
+    /**
+     * Entry point for running the echo server.
+     *
+     * @throws Exception If server execution fails.
+     */
+    static void runExample() throws Exception {
+        Tide.blockOn(EchoServer.run("127.0.0.1:0"));
+    }
+
+    /**
+     * Binds the TCP listener and accepts incoming client connections.
+     *
+     * @param addr Address to listen on.
+     * @throws Exception If binding or socket operation fails.
+     */
+    static async void run(String addr) throws Exception {
+        TcpListener listener = TcpListener.bind(addr);
+        Console.println("Echo server listening on ${listener.localAddr()}");
+        int count = 0;
+        while (count < 5) {
+            TcpStream stream = await listener.accept();
+            Tide.spawn(EchoServer.handleClient(stream));
+            count++;
+        }
+        listener.close();
+    }
+
+    /**
+     * Handles an individual connected client session, echoing incoming text lines.
+     *
+     * @param stream Connected TCP client stream.
+     * @return Unit upon client disconnect.
+     * @throws IOException If I/O operation fails.
+     */
+    private static async Unit handleClient(TcpStream stream) throws IOException {
+        while (true) {
+            String? line = await stream.readLine();
+            if (line == null) {
+                break;
+            }
+            await stream.writeText("echo: $line\n");
+        }
+        stream.close();
+        return new Unit();
+    }
+}

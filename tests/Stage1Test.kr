@@ -1,0 +1,214 @@
+package tests;
+
+import std.io.IOException;
+import std.task.Unit;
+import std.time.Duration;
+import std.time.Instant;
+import tide.Tide;
+import tide.net.TcpListener;
+import tide.net.TcpStream;
+import tide.runtime.CancellationException;
+import tide.runtime.JoinHandle;
+import tide.runtime.Runtime;
+import tide.time.Interval;
+import tide.time.TimeoutException;
+
+final class Stage1Test {
+    private Stage1Test() {}
+
+    @Test
+    static void testBlockOnAndYield() throws Exception {
+        int result = Tide.blockOn(Stage1Test.runYieldTest());
+        Check.equalInt(result, 42);
+    }
+
+    private static async int runYieldTest() {
+        await Tide.yieldNow();
+        await Tide.yieldNow();
+        return 42;
+    }
+
+    @Test
+    static void testRuntimeConfigWith() throws Exception {
+        Runtime.Config config = Runtime.Config.DEFAULT with { threadName = "custom-worker" };
+        int result = Tide.blockOn(config, Stage1Test.runYieldTest());
+        Check.equalInt(result, 42);
+    }
+
+    @Test
+    static void testSpawnAndJoin() throws Exception {
+        int result = Tide.blockOn(Stage1Test.runSpawnTest());
+        Check.equalInt(result, 20);
+    }
+
+    private static async int runSpawnTest() throws Exception {
+        JoinHandle<int> h = Tide.spawn(Stage1Test.childCompute(10));
+        await Tide.yieldNow();
+        await Tide.yieldNow();
+        Check.that(h.isFinished(), "handle is finished");
+        int val = await h;
+        return val;
+    }
+
+    private static async int childCompute(int x) {
+        await Tide.yieldNow();
+        return x * 2;
+    }
+
+    @Test
+    static void testTaskAbort() throws Exception {
+        boolean aborted = Tide.blockOn(Stage1Test.runAbortTest());
+        Check.that(aborted, "task was aborted");
+    }
+
+    private static async boolean runAbortTest() throws Exception {
+        JoinHandle<int> h = Tide.spawn(Stage1Test.childSlow());
+        h.abort();
+        try {
+            await h;
+            return false;
+        } catch (CancellationException e) {
+            return true;
+        }
+    }
+
+    private static async int childSlow() {
+        await Tide.sleepMillis(5000L);
+        return 1;
+    }
+
+    @Test
+    static void testSleep() throws Exception {
+        long elapsed = Tide.blockOn(Stage1Test.runSleepTest());
+        Check.that(elapsed >= 25L, "elapsed at least 25ms");
+    }
+
+    private static async long runSleepTest() {
+        Instant start = Instant.now();
+        await Tide.sleepMillis(30L);
+        return Instant.now().toEpochMilli() - start.toEpochMilli();
+    }
+
+    @Test
+    static void testTimeoutSuccess() throws Exception {
+        int val = Tide.blockOn(Stage1Test.runTimeoutSuccessTest());
+        Check.equalInt(val, 99);
+    }
+
+    private static async int runTimeoutSuccessTest() throws Exception {
+        return await Tide.timeoutMillis(500L, Stage1Test.fastValue());
+    }
+
+    private static async int fastValue() {
+        await Tide.yieldNow();
+        return 99;
+    }
+
+    @Test
+    static void testTimeoutExpired() throws Exception {
+        boolean timedOut = Tide.blockOn(Stage1Test.runTimeoutExpiredTest());
+        Check.that(timedOut, "future timed out");
+    }
+
+    private static async boolean runTimeoutExpiredTest() throws Exception {
+        try {
+            await Tide.timeoutMillis(20L, Stage1Test.childSlow());
+            return false;
+        } catch (TimeoutException e) {
+            return true;
+        }
+    }
+
+    @Test
+    static void testInterval() throws Exception {
+        int ticks = Tide.blockOn(Stage1Test.runIntervalTest());
+        Check.equalInt(ticks, 3);
+    }
+
+    private static async int runIntervalTest() {
+        Interval iv = Tide.intervalMillis(20L);
+        int count = 0;
+        for (int i = 0; i < 3; i++) {
+            await iv.tick();
+            count++;
+        }
+        return count;
+    }
+
+    @Test
+    static void testAsyncTcpEcho() throws Exception {
+        boolean ok = Tide.blockOn(Stage1Test.runEchoTest());
+        Check.that(ok, "echo test passed");
+    }
+
+    private static async boolean runEchoTest() throws Exception {
+        TcpListener listener = TcpListener.bind("127.0.0.1:0");
+        int port = listener.localPort();
+        JoinHandle<Unit> server = Tide.spawn(Stage1Test.echoServer(listener));
+
+        TcpStream client = await TcpStream.connect("127.0.0.1:$port");
+        await client.writeText("hello tide\n");
+        String? line1 = await client.readLine();
+        Check.equal(line1 ?: "", "echo: hello tide");
+
+        await client.writeText("stage 1\n");
+        String? line2 = await client.readLine();
+        Check.equal(line2 ?: "", "echo: stage 1");
+
+        client.close();
+        await server;
+        return true;
+    }
+
+    private static async Unit echoServer(TcpListener listener) throws Exception {
+        TcpStream conn = await listener.accept();
+        String? line1 = await conn.readLine();
+        if (line1 != null) {
+            await conn.writeText("echo: $line1\n");
+        }
+        String? line2 = await conn.readLine();
+        if (line2 != null) {
+            await conn.writeText("echo: $line2\n");
+        }
+        conn.close();
+        listener.close();
+        return new Unit();
+    }
+
+    @Test
+    static void testEchoStress() throws Exception {
+        int count = Tide.blockOn(Stage1Test.runStressTest());
+        Check.equalInt(count, 20);
+    }
+
+    private static async int runStressTest() throws Exception {
+        TcpListener listener = TcpListener.bind("127.0.0.1:0");
+        int port = listener.localPort();
+        JoinHandle<Unit> server = Tide.spawn(Stage1Test.stressServer(listener, 20));
+
+        int completed = 0;
+        for (int i = 0; i < 20; i++) {
+            TcpStream client = await TcpStream.connect("127.0.0.1:$port");
+            await client.writeText("msg $i\n");
+            String? resp = await client.readLine();
+            Check.equal(resp ?: "", "echo: msg $i");
+            client.close();
+            completed++;
+        }
+        await server;
+        return completed;
+    }
+
+    private static async Unit stressServer(TcpListener listener, int total) throws Exception {
+        for (int i = 0; i < total; i++) {
+            TcpStream conn = await listener.accept();
+            String? line = await conn.readLine();
+            if (line != null) {
+                await conn.writeText("echo: $line\n");
+            }
+            conn.close();
+        }
+        listener.close();
+        return new Unit();
+    }
+}

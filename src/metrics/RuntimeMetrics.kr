@@ -1,0 +1,19 @@
+package tide.metrics;
+
+/**
+ * Snapshot of observability metrics for a running Tide runtime.
+ * Captures cumulative task counts, active in-flight tasks, and current scheduler queue depths.
+ *
+ * @param spawnedTasks Total cumulative count of asynchronous tasks scheduled since startup.
+ * @param completedTasks Total cumulative count of tasks that completed (successfully, exceptionally, or aborted).
+ * @param activeTasks Current number of active in-flight tasks (spawned - completed).
+ * @param readyQueueDepth Current number of ready tasks waiting in the scheduler ready queue.
+ * @param blockingQueueDepth Current number of blocking tasks waiting in the blocking thread pool queue.
+ */
+record RuntimeMetrics(
+    long spawnedTasks,
+    long completedTasks,
+    long activeTasks,
+    int readyQueueDepth,
+    int blockingQueueDepth
+) {}

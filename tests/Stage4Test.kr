@@ -1,0 +1,263 @@
+package tests;
+
+import std.task.Unit;
+import std.util.ArrayList;
+import std.util.List;
+import tide.Tide;
+import tide.channel.broadcast.Broadcast;
+import tide.channel.mpsc.Mpsc;
+import tide.channel.oneshot.Oneshot;
+import tide.channel.watch.Watch;
+import tide.future.Pair;
+import tide.future.Select2;
+import tide.future.Tuple3;
+import tide.runtime.JoinHandle;
+import tide.sync.Barrier;
+import tide.sync.BarrierWaitResult;
+import tide.sync.CancellationToken;
+import tide.sync.Mutex;
+import tide.sync.MutexGuard;
+import tide.sync.Notify;
+import tide.sync.OnceCell;
+import tide.sync.RwLock;
+import tide.sync.RwLockReadGuard;
+import tide.sync.RwLockWriteGuard;
+import tide.sync.Semaphore;
+import tide.sync.SemaphorePermit;
+
+final class Stage4Test {
+    private Stage4Test() {}
+
+    @Test
+    static void testAsyncMutex() throws Exception {
+        Tide.blockOn(Stage4Test.runMutexTest());
+    }
+
+    private static async void runMutexTest() throws Exception {
+        Mutex<int> counter = new Mutex<>(0);
+        for (int i = 0; i < 10; i++) {
+            MutexGuard<int> guard = await counter.lock();
+            guard.modify((&mut int v) -> {
+                v = v + 1;
+            });
+            guard.unlockEarly();
+        }
+        int total = counter.map((&mut int v) -> v);
+        Check.equalInt(total, 10);
+    }
+
+    @Test
+    static void testAsyncRwLock() throws Exception {
+        Tide.blockOn(Stage4Test.runRwLockTest());
+    }
+
+    private static async void runRwLockTest() throws Exception {
+        RwLock<String> lock = new RwLock<>("initial");
+        RwLockReadGuard<String> r1 = await lock.read();
+        RwLockReadGuard<String> r2 = await lock.read();
+        String val1 = r1.map((&String s) -> s.clone());
+        String val2 = r2.map((&String s) -> s.clone());
+        Check.that(val1.equals("initial") && val2.equals("initial"), "concurrent reads match");
+        r1.unlockEarly();
+        r2.unlockEarly();
+
+        RwLockWriteGuard<String> w = await lock.write();
+        w.set("updated");
+        w.unlockEarly();
+
+        RwLockReadGuard<String> r3 = await lock.read();
+        String val3 = r3.map((&String s) -> s.clone());
+        Check.that(val3.equals("updated"), "read after write matches");
+    }
+
+    @Test
+    static void testAsyncSemaphore() throws Exception {
+        Tide.blockOn(Stage4Test.runSemaphoreTest());
+    }
+
+    private static async void runSemaphoreTest() throws Exception {
+        Semaphore sem = new Semaphore(2);
+        Check.equalInt(sem.availablePermits(), 2);
+
+        SemaphorePermit p1 = await sem.acquire();
+        Check.equalInt(sem.availablePermits(), 1);
+
+        SemaphorePermit p2 = await sem.acquire();
+        Check.equalInt(sem.availablePermits(), 0);
+
+        p1.releaseEarly();
+        Check.equalInt(sem.availablePermits(), 1);
+
+        SemaphorePermit p3 = await sem.acquire();
+        Check.equalInt(p3.count(), 1);
+        Check.equalInt(sem.availablePermits(), 0);
+    }
+
+    @Test
+    static void testAsyncNotify() throws Exception {
+        Tide.blockOn(Stage4Test.runNotifyTest());
+    }
+
+    private static async void runNotifyTest() throws Exception {
+        Notify notify = new Notify();
+        notify.notifyOne();
+        await notify.notified();
+
+        notify.notifyWaiters();
+    }
+
+    @Test
+    static void testAsyncBarrier() throws Exception {
+        Tide.blockOn(Stage4Test.runBarrierTest());
+    }
+
+    private static async void runBarrierTest() throws Exception {
+        Barrier barrier = new Barrier(1);
+        BarrierWaitResult r = await barrier.wait();
+        Check.that(r.isLeader(), "single waiter is leader");
+    }
+
+    @Test
+    static void testAsyncOnceCell() throws Exception {
+        Tide.blockOn(Stage4Test.runOnceCellTest());
+    }
+
+    private static async void runOnceCellTest() throws Exception {
+        OnceCell<String> cell = new OnceCell<>();
+        Check.that(!cell.isInitialized(), "initially not initialized");
+
+        boolean set1 = cell.set("first");
+        Check.that(set1, "first set succeeded");
+
+        boolean set2 = cell.set("second");
+        Check.that(!set2, "second set failed");
+
+        String? val = cell.map((&String s) -> s.clone());
+        Check.that(val != null && val.equals("first"), "once cell holds first value");
+    }
+
+    @Test
+    static void testCancellationToken() throws Exception {
+        Tide.blockOn(Stage4Test.runCancellationTest());
+    }
+
+    private static async void runCancellationTest() throws Exception {
+        CancellationToken root = new CancellationToken();
+        CancellationToken child = root.childToken();
+
+        Check.that(!root.isCancelled(), "root not cancelled");
+        Check.that(!child.isCancelled(), "child not cancelled");
+
+        root.cancel();
+        Check.that(root.isCancelled(), "root cancelled");
+        Check.that(child.isCancelled(), "child inherited cancellation");
+    }
+
+    @Test
+    static void testChannelOneshot() throws Exception {
+        Tide.blockOn(Stage4Test.runOneshotTest());
+    }
+
+    private static async void runOneshotTest() throws Exception {
+        Oneshot<String> ch = new Oneshot<>();
+        tide.channel.oneshot.Sender<String> tx = ch.sender();
+        tide.channel.oneshot.Receiver<String> rx = ch.receiver();
+
+        tx.send("oneshot-value");
+        String result = await rx;
+        Check.that(result.equals("oneshot-value"), "oneshot value received");
+    }
+
+    @Test
+    static void testChannelMpsc() throws Exception {
+        Tide.blockOn(Stage4Test.runMpscTest());
+    }
+
+    private static async void runMpscTest() throws Exception {
+        Mpsc<int> ch = Mpsc.bounded(10);
+        tide.channel.mpsc.Sender<int> tx = ch.sender();
+        tide.channel.mpsc.Receiver<int> rx = ch.receiver();
+
+        for (int i = 0; i < 5; i++) {
+            await tx.send(i);
+        }
+
+        for (int i = 0; i < 5; i++) {
+            int? val = await rx.receive();
+            Check.that(val == i, "mpsc value matches index");
+        }
+    }
+
+    @Test
+    static void testChannelBroadcast() throws Exception {
+        Tide.blockOn(Stage4Test.runBroadcastTest());
+    }
+
+    private static async void runBroadcastTest() throws Exception {
+        Broadcast<String> ch = Broadcast.channel(16);
+        tide.channel.broadcast.Sender<String> tx = ch.sender();
+        tide.channel.broadcast.Receiver<String> rx1 = ch.subscribe();
+        tide.channel.broadcast.Receiver<String> rx2 = ch.subscribe();
+
+        int receivers = tx.send("hello-all");
+        Check.equalInt(receivers, 2);
+
+        String msg1 = await rx1.receive();
+        String msg2 = await rx2.receive();
+        Check.that(msg1.equals("hello-all") && msg2.equals("hello-all"), "both subscribers got broadcast");
+    }
+
+    @Test
+    static void testChannelWatch() throws Exception {
+        Tide.blockOn(Stage4Test.runWatchTest());
+    }
+
+    private static async void runWatchTest() throws Exception {
+        Watch<int> ch = Watch.channel(100);
+        tide.channel.watch.Sender<int> tx = ch.sender();
+        tide.channel.watch.Receiver<int> rx = ch.receiver();
+
+        int initial = rx.map((&int v) -> v);
+        Check.equalInt(initial, 100);
+
+        tx.send(200);
+        await rx.changed();
+        int updated = rx.map((&int v) -> v);
+        Check.equalInt(updated, 200);
+    }
+
+    @Test
+    static void testJoinAndSelect() throws Exception {
+        Tide.blockOn(Stage4Test.runJoinAndSelectTest());
+    }
+
+    private static async void runJoinAndSelectTest() throws Exception {
+        Pair<int, String> joined = await Tide.join(Stage4Test.produceNumber(), Stage4Test.produceText());
+        Check.equalInt(joined.first(), 42);
+        Check.that(joined.second().equals("tide"), "joined text matches");
+
+        Select2<int, String> selected = await Tide.select(Stage4Test.fastNumber(), Stage4Test.slowText());
+        Check.that(selected.isFirst(), "fast number selected first");
+        Check.that(selected.takeFirst() == 1, "selected number value matches");
+    }
+
+    private static async int produceNumber() {
+        await Tide.sleepMillis(10L);
+        return 42;
+    }
+
+    private static async String produceText() {
+        await Tide.sleepMillis(10L);
+        return "tide";
+    }
+
+    private static async int fastNumber() {
+        await Tide.sleepMillis(5L);
+        return 1;
+    }
+
+    private static async String slowText() {
+        await Tide.sleepMillis(100L);
+        return "slow";
+    }
+}

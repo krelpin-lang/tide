@@ -1,0 +1,101 @@
+package tide.time;
+
+import std.task.Context;
+import std.task.Future;
+import std.task.Poll;
+import std.task.Unit;
+import std.time.Duration;
+import std.time.Instant;
+import tide.runtime.Handle;
+
+/**
+ * Future that completes asynchronously once a specified deadline has passed.
+ * Integrated with the runtime's hierarchical timer driver.
+ */
+final class Sleep implements Future<Unit> {
+    private final Instant deadline;
+    private long? timerId;
+    private boolean completed;
+
+    /**
+     * Constructs a sleep future targetting the given deadline.
+     *
+     * @param deadline Instant at which this future should complete.
+     */
+    Sleep(Instant deadline) {
+        this.deadline = deadline;
+        this.timerId = null;
+        this.completed = false;
+    }
+
+    /**
+     * Creates a Sleep future that resolves at the specified deadline.
+     *
+     * @param deadline Target deadline instant.
+     * @return A new Sleep future.
+     */
+    static Sleep until(Instant deadline) {
+        return new Sleep(deadline);
+    }
+
+    /**
+     * Creates a Sleep future that resolves after the specified duration from now.
+     *
+     * @param duration Duration to sleep.
+     * @return A new Sleep future.
+     */
+    static Sleep after(Duration duration) {
+        return Sleep.until(Instant.now().plus(duration));
+    }
+
+    /**
+     * Creates a Sleep future that resolves after the specified milliseconds from now.
+     *
+     * @param millis Milliseconds to sleep.
+     * @return A new Sleep future.
+     */
+    static Sleep afterMillis(long millis) {
+        return Sleep.until(Instant.now().plusMillis(millis));
+    }
+
+    /**
+     * Returns the target deadline instant.
+     *
+     * @return The target deadline.
+     */
+    Instant deadline() {
+        return this.deadline;
+    }
+
+    /**
+     * Checks whether the sleep future has already completed.
+     *
+     * @return {@code true} if completed; {@code false} otherwise.
+     */
+    boolean isCompleted() {
+        return this.completed;
+    }
+
+    /**
+     * Polls the sleep future for completion. Registers a timer with the ambient runtime
+     * on the first invocation if the deadline is in the future.
+     *
+     * @param cx Polling context with the task waker.
+     * @return {@code Poll.Ready} if the deadline has elapsed; {@code Poll.Pending} otherwise.
+     */
+    @Override
+    mut Poll<Unit> poll(&mut Context cx) {
+        if (this.completed) {
+            return Poll.Ready(new Unit());
+        }
+        Instant now = Instant.now();
+        if (!this.deadline.isAfter(now)) {
+            this.completed = true;
+            return Poll.Ready(new Unit());
+        }
+        if (this.timerId == null) {
+            this.timerId = Handle.current().scheduleTimer(this.deadline, cx.waker());
+        }
+        return Poll.Pending;
+    }
+}

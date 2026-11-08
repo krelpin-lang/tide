@@ -1,0 +1,37 @@
+package tide.channel.watch;
+
+/**
+ * Sending endpoint of a {@link Watch} channel. Only one sender exists per channel.
+ *
+ * @param <T> Watched state type.
+ */
+final class Sender<T> borrows channel {
+    private final &Watch<T> channel;
+
+    /**
+     * Constructs a Sender borrowing the parent watch channel.
+     *
+     * @param channel Parent watch channel.
+     */
+    Sender(&Watch<T> channel) keeps channel {
+        this.channel = channel;
+    }
+
+    /**
+     * Updates the watched value and notifies all observing receivers.
+     *
+     * @param val New state value.
+     */
+    void send(T val) {
+        this.channel.send(val);
+    }
+
+    /**
+     * Subscribes a new receiver from this sender handle.
+     *
+     * @return New Receiver instance.
+     */
+    Receiver<T> subscribe() borrows this {
+        return this.channel.receiver();
+    }
+}

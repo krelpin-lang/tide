@@ -1,0 +1,9 @@
+package tide.sync;
+
+/**
+ * Result returned upon reaching a {@link Barrier}.
+ * Exactly one task in each generation is designated as the leader.
+ *
+ * @param isLeader {@code true} if this task was the last to arrive and elected leader; {@code false} otherwise.
+ */
+record BarrierWaitResult(boolean isLeader) {}

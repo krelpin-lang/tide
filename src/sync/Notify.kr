@@ -1,0 +1,106 @@
+package tide.sync;
+
+import std.task.Poll;
+import std.task.Unit;
+import std.task.Waker;
+import std.util.ArrayDeque;
+import std.util.ArrayList;
+import std.util.List;
+
+/**
+ * An asynchronous event notification primitive.
+ * Enables tasks to wait for an event notification from another task without busy-waiting.
+ * Notifications can store a single permit if fired before a waiter arrives.
+ */
+final class Notify {
+    private final std.sync.Mutex<State> inner;
+
+    /**
+     * Internal state tracking notification permit and queued waiter wakers.
+     */
+    private static final class State {
+        boolean permit;
+        ArrayDeque<Waker> waiters;
+
+        /**
+         * Constructs initial notify state with no permits and an empty waiter list.
+         */
+        State() {
+            this.permit = false;
+            this.waiters = new ArrayDeque<>();
+        }
+    }
+
+    /**
+     * Constructs a Notify instance with no initial permit.
+     */
+    Notify() {
+        this.inner = new std.sync.Mutex<>(new State());
+    }
+
+    /**
+     * Creates a future waiting for notification.
+     *
+     * @return Notified future.
+     */
+    Notified notified() borrows this {
+        return new Notified(this);
+    }
+
+    /**
+     * Polls whether a notification permit is available.
+     *
+     * @param registered Whether caller's waker has been enqueued.
+     * @param waker Task waker to awaken upon notification.
+     * @return Ready with Unit if notified; Pending otherwise.
+     */
+    Poll<Unit> pollNotified(&mut boolean registered, &Waker waker) borrows this {
+        std.sync.Mutex.Guard<State> guard = this.inner.lock();
+        &mut State s = guard.getMut();
+        if (s.permit) {
+            s.permit = false;
+            return Poll.Ready(new Unit());
+        }
+        if (!registered) {
+            s.waiters.add(waker.copy());
+            registered = true;
+        }
+        return Poll.Pending;
+    }
+
+    /**
+     * Notifies a single waiting task. If no tasks are waiting, stores a permit for the next caller.
+     */
+    void notifyOne() {
+        Waker? toWake = null;
+        {
+            std.sync.Mutex.Guard<State> guard = this.inner.lock();
+            &mut State s = guard.getMut();
+            if (s.waiters.size() > 0) {
+                toWake = s.waiters.remove();
+            } else {
+                s.permit = true;
+            }
+        }
+        if (toWake != null) {
+            toWake.wake();
+        }
+    }
+
+    /**
+     * Wakes all tasks currently waiting on this notification. Does not store a permit.
+     */
+    void notifyWaiters() {
+        List<Waker> toWake = new ArrayList<>();
+        {
+            std.sync.Mutex.Guard<State> guard = this.inner.lock();
+            &mut State s = guard.getMut();
+            while (s.waiters.size() > 0) {
+                toWake.add(s.waiters.remove());
+            }
+        }
+        for (int i = 0; i < toWake.size(); i++) {
+            toWake.get(i).wake();
+        }
+    }
+}

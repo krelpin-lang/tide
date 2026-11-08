@@ -1,0 +1,35 @@
+package tide.sync;
+
+import std.task.Context;
+import std.task.Future;
+import std.task.Poll;
+
+/**
+ * Future returned by {@link Barrier#wait()}, resolving to a {@link BarrierWaitResult}
+ * once all participating tasks reach the barrier.
+ */
+final class BarrierFuture borrows barrier implements Future<BarrierWaitResult> {
+    private final &Barrier barrier;
+    private int myGen;
+
+    /**
+     * Constructs a BarrierFuture borrowing the parent Barrier.
+     *
+     * @param barrier Parent barrier.
+     */
+    BarrierFuture(&Barrier barrier) keeps barrier {
+        this.barrier = barrier;
+        this.myGen = -1;
+    }
+
+    /**
+     * Polls the barrier for generation completion.
+     *
+     * @param cx Task polling context.
+     * @return {@code Poll.Ready} when all tasks arrive; {@code Poll.Pending} otherwise.
+     */
+    @Override
+    mut Poll<BarrierWaitResult> poll(&mut Context cx) {
+        return this.barrier.pollWait(&mut this.myGen, cx.waker());
+    }
+}

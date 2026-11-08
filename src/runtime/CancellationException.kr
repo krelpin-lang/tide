@@ -1,0 +1,18 @@
+package tide.runtime;
+
+import std.lang.Exception;
+
+/**
+ * Exception thrown when awaiting a JoinHandle for a task that was aborted
+ * or cancelled prior to completion.
+ */
+final class CancellationException extends Exception {
+    /**
+     * Constructs a CancellationException with the specified descriptive message.
+     *
+     * @param message Detailed cancellation reason.
+     */
+    CancellationException(String message) {
+        super(message);
+    }
+}

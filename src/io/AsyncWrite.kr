@@ -1,0 +1,24 @@
+package tide.io;
+
+import std.task.Future;
+import std.task.Unit;
+
+/**
+ * Trait for types that provide asynchronous, non-blocking byte-stream writing capabilities.
+ */
+interface AsyncWrite {
+    /**
+     * Asynchronously writes a slice of bytes into the stream.
+     *
+     * @param bytes Byte slice to write.
+     * @return Future yielding the number of bytes written.
+     */
+    mut Future<int> write(&byte[] bytes);
+
+    /**
+     * Asynchronously flushes any buffered output bytes to the underlying transport.
+     *
+     * @return Future yielding {@link Unit} on successful flush.
+     */
+    mut Future<Unit> flush();
+}

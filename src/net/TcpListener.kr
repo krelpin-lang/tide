@@ -1,0 +1,93 @@
+package tide.net;
+
+import std.io.IOException;
+import std.net.Poller;
+import std.net.SocketAddr;
+import tide.reactor.ReadReady;
+import tide.runtime.Handle;
+
+/**
+ * Asynchronous TCP socket server that listens for incoming stream connections.
+ * Registered with the runtime reactor to await client connections without blocking.
+ */
+final class TcpListener {
+    private final int token;
+    private std.net.TcpListener raw;
+    private boolean closed;
+
+    /**
+     * Constructs a TcpListener wrapping a raw socket and reactor token.
+     *
+     * @param token Reactor registration token.
+     * @param raw Raw network listener.
+     */
+    private TcpListener(int token, std.net.TcpListener raw) {
+        this.token = token;
+        this.raw = raw;
+        this.closed = false;
+    }
+
+    /**
+     * Binds a new TCP listener to the specified address string (e.g. "127.0.0.1:8080").
+     *
+     * @param address Socket bind address.
+     * @return Newly bound and reactor-registered TcpListener.
+     * @throws IOException If binding to the address fails.
+     */
+    static TcpListener bind(String address) throws IOException {
+        std.net.TcpListener raw = std.net.TcpListener.bind(address);
+        int token = Handle.current().registerListener(&mut raw);
+        return new TcpListener(token, raw);
+    }
+
+    /**
+     * Asynchronously accepts an incoming TCP connection.
+     *
+     * @return The connected asynchronous TcpStream.
+     * @throws IOException If accepting the connection fails.
+     */
+    mut async TcpStream accept() throws IOException {
+        while (true) {
+            std.net.TcpStream? stream = std.net.TcpStream.tryAccept(&mut this.raw);
+            if (stream != null) {
+                int streamToken = Handle.current().registerStream(&mut stream, Poller.Interest.READ_WRITE);
+                return TcpStream.fromRaw(streamToken, stream);
+            }
+            Handle.current().clearReadable(this.token);
+            await new ReadReady(this.token);
+        }
+    }
+
+    /**
+     * Returns the local socket address this listener is bound to.
+     *
+     * @return Local SocketAddr.
+     * @throws IOException If retrieving socket info fails.
+     */
+    SocketAddr localAddr() throws IOException {
+        return this.raw.localAddr();
+    }
+
+    /**
+     * Returns the bound local TCP port.
+     *
+     * @return Local port integer.
+     * @throws IOException If retrieving socket info fails.
+     */
+    int localPort() throws IOException {
+        return this.raw.localAddr().port();
+    }
+
+    /**
+     * Closes the listener socket and deregisters it from the runtime reactor.
+     */
+    mut void close() {
+        if (this.closed) {
+            return;
+        }
+        this.closed = true;
+        try {
+            Handle.current().deregisterListener(&mut this.raw, this.token);
+        } catch (IOException e) {}
+    }
+}

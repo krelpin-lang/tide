@@ -1,0 +1,39 @@
+package tide.runtime;
+
+import std.task.Context;
+import std.task.Future;
+import std.task.Poll;
+import std.task.Unit;
+
+/**
+ * Future returned by {@code Runtime.yieldNow()} or {@code Tide.yieldNow()}.
+ * Returns {@code Poll.Pending} once to cooperatively surrender execution back
+ * to the scheduler, then resolves with {@code Unit} on the subsequent poll.
+ */
+final class YieldNow implements Future<Unit> {
+    private boolean yielded;
+
+    /**
+     * Initializes a new yield future.
+     */
+    YieldNow() {
+        this.yielded = false;
+    }
+
+    /**
+     * Polls the yield future. The first call wakes the waker and yields pending;
+     * subsequent calls return ready.
+     *
+     * @param cx Polling context providing the task waker.
+     * @return {@code Poll.Pending} on first invocation, {@code Poll.Ready} thereafter.
+     */
+    @Override
+    mut Poll<Unit> poll(&mut Context cx) {
+        if (this.yielded) {
+            return Poll.Ready(new Unit());
+        }
+        this.yielded = true;
+        cx.waker().wake();
+        return Poll.Pending;
+    }
+}

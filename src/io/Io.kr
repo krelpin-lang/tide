@@ -1,0 +1,126 @@
+package tide.io;
+
+import std.io.IOException;
+import std.util.ArrayList;
+import std.util.List;
+
+/**
+ * Utility functions for asynchronous I/O streams: copying between streams,
+ * reading exact byte sequences, reading to EOF, and writing complete buffers.
+ */
+final class Io {
+    /**
+     * Prevents direct instantiation of this static utility class.
+     */
+    private Io() {}
+
+    /**
+     * Copies a range of bytes from a source array to a destination array.
+     *
+     * @param src Source array.
+     * @param srcPos Source starting index.
+     * @param dst Destination array.
+     * @param dstPos Destination starting index.
+     * @param length Number of bytes to copy.
+     */
+    static void copyBytes(&byte[] src, int srcPos, &mut byte[] dst, int dstPos, int length) {
+        for (int i = 0; i < length; i++) {
+            dst[dstPos + i] = src[srcPos + i];
+        }
+    }
+
+    /**
+     * Asynchronously writes all bytes in the given array to the writer until complete.
+     *
+     * @param writer Target asynchronous writer.
+     * @param bytes Bytes to transmit completely.
+     * @throws Exception If an I/O error or premature EOF occurs.
+     */
+    static async <W extends AsyncWrite> void writeAll(&mut W writer, &byte[] bytes) throws Exception {
+        int written = 0;
+        while (written < bytes.length) {
+            int remaining = bytes.length - written;
+            byte[] slice = new byte[remaining];
+            Io.copyBytes(bytes, written, &mut slice, 0, remaining);
+            int n = await writer.write(&slice);
+            if (n <= 0) {
+                throw new IOException("failed to write whole buffer");
+            }
+            written += n;
+        }
+    }
+
+    /**
+     * Asynchronously copies all bytes from the reader to the writer until EOF, then flushes.
+     *
+     * @param reader Source reader.
+     * @param writer Destination writer.
+     * @return Total number of bytes copied.
+     * @throws Exception If an I/O error occurs.
+     */
+    static async <R extends AsyncRead, W extends AsyncWrite> long copy(&mut R reader, &mut W writer) throws Exception {
+        long total = 0L;
+        while (true) {
+            byte[] chunk = await reader.read(8192);
+            if (chunk.length == 0) {
+                break;
+            }
+            await Io.writeAll(writer, &chunk);
+            total += (long) chunk.length;
+        }
+        await writer.flush();
+        return total;
+    }
+
+    /**
+     * Asynchronously reads all remaining bytes from the reader until EOF.
+     *
+     * @param reader Source reader.
+     * @return Complete byte array containing all read data.
+     * @throws Exception If an I/O error occurs.
+     */
+    static async <R extends AsyncRead> byte[] readToEnd(&mut R reader) throws Exception {
+        List<byte[]> chunks = new ArrayList<>();
+        int total = 0;
+        while (true) {
+            byte[] chunk = await reader.read(4096);
+            if (chunk.length == 0) {
+                break;
+            }
+            total += chunk.length;
+            chunks.add(chunk);
+        }
+        byte[] result = new byte[total];
+        int pos = 0;
+        for (int i = 0; i < chunks.size(); i++) {
+            &byte[] c = chunks.get(i);
+            Io.copyBytes(c, 0, &mut result, pos, c.length);
+            pos += c.length;
+        }
+        return result;
+    }
+
+    /**
+     * Asynchronously reads exactly {@code length} bytes from the reader.
+     *
+     * @param reader Source reader.
+     * @param length Exact byte count required.
+     * @return Byte array of exactly {@code length} bytes.
+     * @throws IOException If EOF is encountered before reading {@code length} bytes.
+     * @throws Exception If an I/O error occurs.
+     */
+    static async <R extends AsyncRead> byte[] readExact(&mut R reader, int length) throws Exception {
+        byte[] result = new byte[length];
+        int filled = 0;
+        while (filled < length) {
+            int needed = length - filled;
+            byte[] chunk = await reader.read(needed);
+            if (chunk.length == 0) {
+                throw new IOException("unexpected end of stream before filling buffer");
+            }
+            Io.copyBytes(&chunk, 0, &mut result, filled, chunk.length);
+            filled += chunk.length;
+        }
+        return result;
+    }
+}

@@ -1,0 +1,26 @@
+package tide.future;
+
+import std.task.Future;
+
+/**
+ * Combinator utility for racing multiple futures.
+ */
+final class Select {
+    /**
+     * Prevents direct instantiation of this static utility class.
+     */
+    private Select() {}
+
+    /**
+     * Races two futures concurrently, returning when either one resolves.
+     *
+     * @param <A> First future value type.
+     * @param <B> Second future value type.
+     * @param a First future branch.
+     * @param b Second future branch.
+     * @return Select2Future yielding {@link Select2}.
+     */
+    static <A, B> Select2Future<A, B> select(Future<A> a, Future<B> b) {
+        return new Select2Future<>(a, b);
+    }
+}

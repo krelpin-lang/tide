@@ -1,0 +1,36 @@
+package tide.channel.mpsc;
+
+import std.task.Context;
+import std.task.Future;
+import std.task.Poll;
+
+/**
+ * Future returned by {@link Receiver#receive()}, resolving to the next message
+ * or {@code null} when all senders have disconnected.
+ *
+ * @param <T> Transferred message type.
+ */
+final class RecvFuture<T> borrows channel implements Future<T?> {
+    private final &Mpsc<T> channel;
+
+    /**
+     * Constructs a RecvFuture borrowing the parent MPSC channel.
+     *
+     * @param channel Parent MPSC channel.
+     */
+    RecvFuture(&Mpsc<T> channel) keeps channel {
+        this.channel = channel;
+    }
+
+    /**
+     * Polls the channel for an incoming message.
+     *
+     * @param cx Task polling context.
+     * @return {@code Poll.Ready(message)} when available, {@code Poll.Ready(null)} if closed,
+     *         or {@code Poll.Pending}.
+     */
+    @Override
+    mut Poll<T?> poll(&mut Context cx) {
+        return this.channel.pollReceive(cx.waker());
+    }
+}

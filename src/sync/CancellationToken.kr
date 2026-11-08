@@ -1,0 +1,139 @@
+package tide.sync;
+
+import std.lang.Objects;
+import std.task.Poll;
+import std.task.Unit;
+import std.task.Waker;
+import std.util.ArrayList;
+import std.util.List;
+
+/**
+ * Cooperative cancellation token enabling graceful cancellation across task hierarchies.
+ * Child tokens automatically observe cancellation when their parent is cancelled.
+ */
+final class CancellationToken borrows parent {
+    private final &CancellationToken? parent;
+    private final std.sync.Mutex<State> inner;
+
+    /**
+     * Internal state container tracking cancellation status and waiter wakers.
+     */
+    private static final class State {
+        boolean cancelled;
+        List<Waker> waiters;
+
+        /**
+         * Constructs initial uncancelled state with an empty waiter list.
+         */
+        State() {
+            this.cancelled = false;
+            this.waiters = new ArrayList<>();
+        }
+    }
+
+    /**
+     * Constructs a root CancellationToken.
+     */
+    CancellationToken() {
+        this.parent = null;
+        this.inner = new std.sync.Mutex<>(new State());
+    }
+
+    /**
+     * Constructs a child CancellationToken linked to a parent token.
+     *
+     * @param parent Parent token reference.
+     */
+    private CancellationToken(&CancellationToken parent) keeps parent {
+        this.parent = parent;
+        this.inner = new std.sync.Mutex<>(new State());
+    }
+
+    /**
+     * Checks whether this token or any ancestor token has been cancelled.
+     *
+     * @return {@code true} if cancelled; {@code false} otherwise.
+     */
+    boolean isCancelled() {
+        &CancellationToken? p = this.parent;
+        if (p != null && p.isCancelled()) {
+            return true;
+        }
+        std.sync.Mutex.Guard<State> guard = this.inner.lock();
+        return guard.get().cancelled;
+    }
+
+    /**
+     * Creates a child cancellation token linked to this token.
+     *
+     * @return Child CancellationToken.
+     */
+    CancellationToken childToken() borrows this {
+        return new CancellationToken(this);
+    }
+
+    /**
+     * Cancels this token, awakening all tasks currently waiting on its cancellation.
+     */
+    void cancel() {
+        List<Waker>? toWake = null;
+        {
+            std.sync.Mutex.Guard<State> guard = this.inner.lock();
+            &mut State s = guard.getMut();
+            if (s.cancelled) {
+                return;
+            }
+            s.cancelled = true;
+            toWake = Objects.replace(&mut s.waiters, new ArrayList<>());
+        }
+        if (toWake != null) {
+            for (int i = 0; i < toWake.size(); i++) {
+                toWake.get(i).wake();
+            }
+        }
+    }
+
+    /**
+     * Creates a future that resolves when this token is cancelled.
+     *
+     * @return CancelledFuture resolving to {@link Unit}.
+     */
+    CancelledFuture cancelled() borrows this {
+        return new CancelledFuture(this);
+    }
+
+    /**
+     * Polls whether the token or any parent token has been cancelled.
+     *
+     * @param registered Whether caller's waker has been registered.
+     * @param waker Task waker to awaken upon cancellation.
+     * @return Ready with Unit if cancelled; Pending otherwise.
+     */
+    Poll<Unit> pollCancelled(&mut boolean registered, &Waker waker) borrows this {
+        if (this.isCancelled()) {
+            return Poll.Ready(new Unit());
+        }
+        if (!registered) {
+            this.registerWaiter(waker);
+            &CancellationToken? p = this.parent;
+            if (p != null) {
+                p.registerWaiter(waker);
+            }
+            registered = true;
+        }
+        return Poll.Pending;
+    }
+
+    /**
+     * Registers a task waker to be awakened when cancellation is triggered.
+     *
+     * @param waker Task waker reference.
+     */
+    void registerWaiter(&Waker waker) {
+        std.sync.Mutex.Guard<State> guard = this.inner.lock();
+        &mut State s = guard.getMut();
+        if (!s.cancelled) {
+            s.waiters.add(waker.copy());
+        }
+    }
+}

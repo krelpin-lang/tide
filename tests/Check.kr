@@ -1,0 +1,29 @@
+package tests;
+
+final class Check {
+    private Check() {}
+
+    static void equal(String actual, String expected) {
+        if (actual != expected) {
+            throw new IllegalStateException("expected `$expected`, got `$actual`");
+        }
+    }
+
+    static void equalInt(int actual, int expected) {
+        if (actual != expected) {
+            throw new IllegalStateException("expected `$expected`, got `$actual`");
+        }
+    }
+
+    static void equalLong(long actual, long expected) {
+        if (actual != expected) {
+            throw new IllegalStateException("expected `$expected`, got `$actual`");
+        }
+    }
+
+    static void that(boolean condition, String what) {
+        if (!condition) {
+            throw new IllegalStateException("expected $what");
+        }
+    }
+}

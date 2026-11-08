@@ -1,0 +1,39 @@
+package tide.reactor;
+
+import std.task.Context;
+import std.task.Future;
+import std.task.Poll;
+import std.task.Unit;
+import tide.runtime.Handle;
+
+/**
+ * Future that completes when a registered I/O descriptor becomes readable in the reactor.
+ */
+final class ReadReady implements Future<Unit> {
+    private final int token;
+
+    /**
+     * Constructs a ReadReady future for the specified registration token.
+     *
+     * @param token Reactor registration token.
+     */
+    ReadReady(int token) {
+        this.token = token;
+    }
+
+    /**
+     * Polls the reactor for read readiness. Registers the current task waker if pending.
+     *
+     * @param cx Task polling context.
+     * @return {@code Poll.Ready} if readable; {@code Poll.Pending} otherwise.
+     */
+    @Override
+    mut Poll<Unit> poll(&mut Context cx) {
+        Handle handle = Handle.current();
+        if (handle.isReadable(this.token)) {
+            return Poll.Ready(new Unit());
+        }
+        handle.readWaker(this.token, cx.waker().copy());
+        return Poll.Pending;
+    }
+}

@@ -1,0 +1,144 @@
+package tests;
+
+import std.io.IOException;
+import std.sync.AtomicInt;
+import std.task.Unit;
+import std.util.ArrayList;
+import std.util.List;
+import tide.Tide;
+import tide.runtime.CancellationException;
+import tide.runtime.JoinHandle;
+import tide.runtime.JoinSet;
+import tide.runtime.Runtime;
+
+final class Stage2Test {
+    private Stage2Test() {}
+
+    @Test
+    static void testSpawnBlocking() throws Exception {
+        String result = Tide.blockOn(Stage2Test.runSpawnBlockingTest());
+        Check.that(result.equals("blocking-success"), "result matches");
+    }
+
+    private static async String runSpawnBlockingTest() throws Exception {
+        JoinHandle<String> h = Tide.spawnBlocking(() -> {
+            return "blocking-success";
+        });
+        return await h;
+    }
+
+    @Test
+    static void testSpawnBlockingException() throws Exception {
+        boolean failed = Tide.blockOn(Stage2Test.runSpawnBlockingExceptionTest());
+        Check.that(failed, "exception caught");
+    }
+
+    private static async boolean runSpawnBlockingExceptionTest() {
+        JoinHandle<String> h = Tide.spawnBlocking(() -> {
+            throw new IllegalStateException("blocking error");
+        });
+        try {
+            await h;
+            return false;
+        } catch (Exception e) {
+            return true;
+        }
+    }
+
+    @Test
+    static void testJoinSet() throws Exception {
+        int count = Tide.blockOn(Stage2Test.runJoinSetTest());
+        Check.equalInt(count, 5);
+    }
+
+    private static async int runJoinSetTest() throws Exception {
+        JoinSet<int> set = new JoinSet<>();
+        for (int i = 0; i < 5; i++) {
+            int val = i;
+            JoinSet.spawnOn(&mut set, Stage2Test.computeSquare(val));
+        }
+        Check.equalInt(set.size(), 5);
+        int collected = 0;
+        while (!set.isEmpty()) {
+            int? res = await set.joinNext();
+            if (res != null) {
+                collected++;
+            }
+        }
+        return collected;
+    }
+
+    @Test
+    static void testJoinSetAbortAll() throws Exception {
+        int aborted = Tide.blockOn(Stage2Test.runJoinSetAbortTest());
+        Check.equalInt(aborted, 0);
+    }
+
+    private static async int runJoinSetAbortTest() throws Exception {
+        JoinSet<int> set = new JoinSet<>();
+        for (int i = 0; i < 3; i++) {
+            JoinSet.spawnOn(&mut set, Stage2Test.slowTask());
+        }
+        set.abortAll();
+        Check.equalInt(set.size(), 0);
+        return set.size();
+    }
+
+    private static async int slowTask() {
+        await Tide.sleepMillis(5000L);
+        return 1;
+    }
+
+    @Test
+    static void testMultiThreadExecution() throws Exception {
+        Runtime.Config config = Runtime.Config.multiThread(4);
+        int total = Tide.blockOn(config, Stage2Test.runMultiThreadTasks());
+        Check.equalInt(total, 55);
+    }
+
+    @Test
+    static void testMultiThreadStress() throws Exception {
+        Runtime.Config config = Runtime.Config.multiThread(4);
+        int total = Tide.blockOn(config, Stage2Test.runStressTasks(100));
+        Check.equalInt(total, 100);
+    }
+
+    private static async int runStressTasks(int count) throws Exception {
+        JoinSet<int> set = new JoinSet<>();
+        for (int i = 0; i < count; i++) {
+            JoinSet.spawnOn(&mut set, Stage2Test.quickCompute(1));
+        }
+        int sum = 0;
+        while (!set.isEmpty()) {
+            int? val = await set.joinNext();
+            if (val != null) {
+                sum += val;
+            }
+        }
+        return sum;
+    }
+
+    private static async int quickCompute(int x) {
+        await Tide.yieldNow();
+        return x;
+    }
+
+    private static async int runMultiThreadTasks() throws Exception {
+        List<JoinHandle<int>> handles = new ArrayList<>();
+        for (int i = 1; i <= 10; i++) {
+            int val = i;
+            handles.add(Tide.spawn(Stage2Test.computeSquare(val)));
+        }
+        int sum = 0;
+        while (!handles.isEmpty()) {
+            JoinHandle<int> h = handles.remove(0);
+            sum += await h;
+        }
+        return sum;
+    }
+
+    private static async int computeSquare(int x) {
+        await Tide.yieldNow();
+        return x;
+    }
+}

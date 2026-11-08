@@ -1,0 +1,82 @@
+package examples;
+
+import std.io.IOException;
+import std.lang.Console;
+import std.net.SocketAddr;
+import std.task.Unit;
+import tide.Tide;
+import tide.channel.broadcast.Broadcast;
+import tide.channel.broadcast.Receiver;
+import tide.channel.broadcast.Sender;
+import tide.future.Select2;
+import tide.net.TcpListener;
+import tide.net.TcpStream;
+
+/**
+ * Multi-user asynchronous TCP chat room server example.
+ */
+final class ChatServer {
+    private static final Broadcast<String> ROOM = Broadcast.channel(64);
+
+    /**
+     * Prevents direct instantiation of this chat server class.
+     */
+    private ChatServer() {}
+
+    /**
+     * Entry point for running the chat server.
+     *
+     * @throws Exception If chat server execution fails.
+     */
+    static void runExample() throws Exception {
+        Tide.blockOn(ChatServer.run("127.0.0.1:0"));
+    }
+
+    /**
+     * Binds the chat listener and spawns client handling tasks.
+     *
+     * @param addr Address to listen on.
+     * @throws Exception If socket operations fail.
+     */
+    static async void run(String addr) throws Exception {
+        TcpListener listener = TcpListener.bind(addr);
+        Console.println("Chat server listening on ${listener.localAddr()}");
+        int count = 0;
+        while (count < 5) {
+            TcpStream stream = await listener.accept();
+            Tide.spawn(ChatServer.handleChatClient(stream));
+            count++;
+        }
+        listener.close();
+    }
+
+    /**
+     * Handles an active chat client connection by subscribing to the broadcast room.
+     *
+     * @param stream Connected TCP client stream.
+     * @return Unit upon client disconnect.
+     * @throws Exception If socket operation fails.
+     */
+    private static async Unit handleChatClient(TcpStream stream) throws Exception {
+        Receiver<String> sub = ChatServer.ROOM.subscribe();
+        Sender<String> tx = ChatServer.ROOM.sender();
+        await stream.writeText("welcome to tide chat\n");
+        while (true) {
+            Select2<String?, String> action = await Tide.select(stream.readLine(), sub.receive());
+            if (action.isFirst()) {
+                String? incoming = action.takeFirst() ?: null;
+                if (incoming == null) {
+                    break;
+                }
+                tx.send(incoming);
+            } else {
+                String? broadcastMsg = action.takeSecond();
+                if (broadcastMsg != null) {
+                    await stream.writeText("[$broadcastMsg]\n");
+                }
+            }
+        }
+        stream.close();
+        return new Unit();
+    }
+}

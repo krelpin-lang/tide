@@ -1,0 +1,55 @@
+package tide.sync;
+
+import std.lang.AutoCloseable;
+
+/**
+ * RAII guard granting shared read-only access to an asynchronous {@link RwLock}.
+ * Automatically releases shared read access upon leaving scope.
+ *
+ * @param <T> Protected data type.
+ */
+final class RwLockReadGuard<T> borrows lock implements AutoCloseable {
+    private final &RwLock<T> lock;
+    private boolean active;
+
+    /**
+     * Constructs an RwLockReadGuard borrowing the parent RwLock.
+     *
+     * @param lock Parent reader-writer lock.
+     */
+    RwLockReadGuard(&RwLock<T> lock) keeps lock {
+        this.lock = lock;
+        this.active = true;
+    }
+
+    /**
+     * Automatically invoked when dropped, releasing the shared read lock.
+     */
+    @Override
+    mut void close() {
+        if (this.active) {
+            this.active = false;
+            this.lock.unlockRead();
+        }
+    }
+
+    /**
+     * Explicitly releases the read lock early before leaving scope.
+     */
+    mut void unlockEarly() {
+        if (this.active) {
+            this.active = false;
+            this.lock.unlockRead();
+        }
+    }
+
+    /**
+     * Inspects or maps the protected value.
+     *
+     * @param func Read-only mapping callback.
+     * @return Computed result.
+     */
+    <R> R map(RwLock.ReadFunc<T, R> func) {
+        return this.lock.readMap(func);
+    }
+}

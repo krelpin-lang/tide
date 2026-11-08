@@ -1,0 +1,225 @@
+package tide.sync;
+
+import std.lang.Objects;
+import std.task.Context;
+import std.task.Future;
+import std.task.Poll;
+import std.task.Unit;
+import std.task.Waker;
+import std.util.ArrayList;
+import std.util.List;
+
+/**
+ * A cell that can be written to exactly once, providing thread-safe one-time initialization
+ * for asynchronous applications.
+ *
+ * @param <T> Initialized value type.
+ */
+final class OnceCell<T> {
+    private final std.sync.Mutex<State<T>> inner;
+
+    /**
+     * Internal state container for the asynchronous OnceCell.
+     *
+     * @param <T> Initialized value type.
+     */
+    private static final class State<T> {
+        boolean initializing;
+        List<T> items;
+        List<Waker> waiters;
+
+        /**
+         * Constructs initial uninitialized OnceCell state.
+         */
+        State() {
+            this.initializing = false;
+            this.items = new ArrayList<>();
+            this.waiters = new ArrayList<>();
+        }
+    }
+
+    /**
+     * Constructs an empty uninitialized OnceCell.
+     */
+    OnceCell() {
+        this.inner = new std.sync.Mutex<>(new State<>());
+    }
+
+    /**
+     * Checks whether the cell has already been initialized.
+     *
+     * @return {@code true} if initialized; {@code false} otherwise.
+     */
+    boolean isInitialized() {
+        std.sync.Mutex.Guard<State<T>> guard = this.inner.lock();
+        return guard.get().items.size() > 0;
+    }
+
+    /**
+     * Attempts to set the cell's value. Succeeds if uninitialized, fails if already initialized.
+     *
+     * @param val Value to store.
+     * @return {@code true} if initialized by this call; {@code false} if already initialized.
+     */
+    boolean set(T val) {
+        List<Waker>? toWake = null;
+        {
+            std.sync.Mutex.Guard<State<T>> guard = this.inner.lock();
+            &mut State<T> s = guard.getMut();
+            if (s.items.size() > 0) {
+                return false;
+            }
+            s.items.add(val);
+            s.initializing = false;
+            toWake = Objects.replace(&mut s.waiters, new ArrayList<>());
+        }
+        if (toWake != null) {
+            for (int i = 0; i < toWake.size(); i++) {
+                toWake.get(i).wake();
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Functional callback to inspect the initialized value.
+     *
+     * @param <T> Value type.
+     * @param <R> Return type.
+     */
+    interface Func<T, R> {
+        R apply(&T value);
+    }
+
+    /**
+     * Maps the cell's value if initialized, or returns {@code null} if empty.
+     *
+     * @param func Mapping callback.
+     * @return Transformed value, or {@code null} if uninitialized.
+     */
+    <R> R? map(Func<T, R> func) {
+        std.sync.Mutex.Guard<State<T>> guard = this.inner.lock();
+        &State<T> s = guard.get();
+        if (s.items.size() == 0) {
+            return null;
+        }
+        &T val = s.items.get(0);
+        return func.apply(val);
+    }
+
+    /**
+     * Asynchronous initializer callback producing the initial value.
+     *
+     * @param <T> Initialized value type.
+     */
+    interface Initializer<T> {
+        Future<T> initialize() throws Exception;
+    }
+
+    /**
+     * Gets the existing value if initialized, or runs the initializer asynchronously.
+     * Concurrently arriving callers wait for initialization to complete.
+     *
+     * @param init Initializer future factory.
+     * @param func Mapping callback.
+     * @return Computed result.
+     * @throws Exception If initialization fails.
+     */
+    async <R> R getOrInit(Initializer<T> init, Func<T, R> func) throws Exception {
+        while (true) {
+            boolean shouldInit = false;
+            {
+                std.sync.Mutex.Guard<State<T>> guard = this.inner.lock();
+                &mut State<T> s = guard.getMut();
+                if (s.items.size() > 0) {
+                    &T val = s.items.get(0);
+                    return func.apply(val);
+                }
+                if (!s.initializing) {
+                    s.initializing = true;
+                    shouldInit = true;
+                }
+            }
+            if (shouldInit) {
+                try {
+                    T val = await init.initialize();
+                    this.set(val);
+                } catch (Exception e) {
+                    this.failInit();
+                    throw e;
+                }
+            } else {
+                await new WaitInit<>(this);
+            }
+        }
+    }
+
+    /**
+     * Polls whether OnceCell initialization has concluded.
+     *
+     * @param registered Whether caller's waker has been enqueued.
+     * @param waker Task waker to awaken once initialization finishes or fails.
+     * @return Ready with Unit if initialized; Pending otherwise.
+     */
+    Poll<Unit> pollWait(&mut boolean registered, &Waker waker) borrows this {
+        std.sync.Mutex.Guard<State<T>> guard = this.inner.lock();
+        &mut State<T> s = guard.getMut();
+        if (s.items.size() > 0 || !s.initializing) {
+            return Poll.Ready(new Unit());
+        }
+        if (!registered) {
+            s.waiters.add(waker.copy());
+            registered = true;
+        }
+        return Poll.Pending;
+    }
+
+    /**
+     * Handles initialization failure by resetting initializing flag and awakening all waiters.
+     */
+    private void failInit() {
+        List<Waker>? toWake = null;
+        {
+            std.sync.Mutex.Guard<State<T>> guard = this.inner.lock();
+            &mut State<T> s = guard.getMut();
+            s.initializing = false;
+            toWake = Objects.replace(&mut s.waiters, new ArrayList<>());
+        }
+        if (toWake != null) {
+            for (int i = 0; i < toWake.size(); i++) {
+                toWake.get(i).wake();
+            }
+        }
+    }
+
+    /**
+     * Helper future waiting for active initialization to complete.
+     *
+     * @param <T> Initialized value type.
+     */
+    private static final class WaitInit<T> borrows cell implements Future<Unit> {
+        private final &OnceCell<T> cell;
+        private boolean registered;
+
+        /**
+         * Constructs a WaitInit future borrowing the parent OnceCell.
+         *
+         * @param cell Parent OnceCell.
+         */
+        WaitInit(&OnceCell<T> cell) keeps cell {
+            this.cell = cell;
+            this.registered = false;
+        }
+
+        /**
+         * Polls whether the cell is ready.
+         *
+         * @param cx Task polling context.
+         * @return {@link Poll.Ready} if initialized; {@link Poll.Pending} otherwise.
+         */
+        @Override
+        mut Poll<Unit> poll(&mut Context cx) {
+            return this.cell.pollWait(&mut this.registered, cx.waker());
+        }
+    }
+}

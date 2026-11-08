@@ -1,0 +1,282 @@
+package tide.runtime;
+
+import std.function.Supplier;
+import std.io.IOException;
+import std.lang.IllegalStateException;
+import std.lang.Thread;
+import std.net.Poller;
+import std.net.TcpListener;
+import std.net.TcpStream;
+import std.net.UdpSocket;
+import std.sync.Mutex;
+import std.task.Future;
+import std.task.Poll;
+import std.task.Waker;
+import std.time.Instant;
+import std.util.HashMap;
+import std.util.Map;
+
+/**
+ * Lightweight reference handle to a running Tide runtime instance.
+ * Allows tasks and I/O drivers to interact with their host runtime (spawning tasks,
+ * registering sockets with the reactor, scheduling timers, and retrieving metrics).
+ *
+ * @param id The unique integer identifier of the target runtime.
+ */
+record Handle(int id) {
+    private static final Mutex<Map<long, int>> CURRENT_RUNTIMES = new Mutex<>(new HashMap<>());
+
+    /**
+     * Obtains the Handle associated with the active runtime executing on the current thread.
+     *
+     * @return Active runtime Handle.
+     * @throws IllegalStateException If no runtime is currently active on this thread.
+     */
+    static Handle current() {
+        long threadId = Thread.currentId();
+        Mutex.Guard<Map<long, int>> guard = Handle.CURRENT_RUNTIMES.lock();
+        (&int)? runtimeId = guard.get().get(&threadId);
+        if (runtimeId == null) {
+            throw new IllegalStateException("no tide runtime is active on the current thread");
+        }
+        return new Handle(runtimeId);
+    }
+
+    /**
+     * Binds the given Handle to the current thread.
+     *
+     * @param handle The Handle to associate.
+     */
+    static void setCurrent(Handle handle) {
+        long threadId = Thread.currentId();
+        Mutex.Guard<Map<long, int>> guard = Handle.CURRENT_RUNTIMES.lock();
+        guard.getMut().put(threadId, handle.id());
+    }
+
+    /**
+     * Clears the ambient runtime binding for the current thread.
+     */
+    static void clearCurrent() {
+        long threadId = Thread.currentId();
+        Mutex.Guard<Map<long, int>> guard = Handle.CURRENT_RUNTIMES.lock();
+        guard.getMut().remove(&threadId);
+    }
+
+    /**
+     * Spawns a detached task onto the ambient runtime.
+     *
+     * @param future The task future to spawn.
+     * @return JoinHandle for awaiting the task.
+     */
+    static <T> JoinHandle<T> spawn(Future<T> future) keeps future {
+        return Runtime.spawnDetached(future);
+    }
+
+    /**
+     * Spawns a blocking action onto the ambient runtime's blocking pool.
+     *
+     * @param action The blocking action to execute.
+     * @return JoinHandle for awaiting the result.
+     */
+    static <T> JoinHandle<T> spawnBlocking(BlockingAction<T> action) keeps action {
+        return Runtime.spawnBlockingDetached(action);
+    }
+
+    /**
+     * Registers a TCP listener with the runtime reactor for read readiness.
+     *
+     * @param listener The listener to register.
+     * @return Registration token.
+     * @throws IOException If reactor registration fails.
+     */
+    int registerListener(&mut TcpListener listener) throws IOException {
+        return Runtime.registerListener(this.id, listener);
+    }
+
+    /**
+     * Registers a TCP stream with the runtime reactor with the specified interest.
+     *
+     * @param stream The stream to register.
+     * @param interest Poller interest mask (Readable, Writable, or Both).
+     * @return Registration token.
+     * @throws IOException If reactor registration fails.
+     */
+    int registerStream(&mut TcpStream stream, Poller.Interest interest) throws IOException {
+        return Runtime.registerStream(this.id, stream, interest);
+    }
+
+    /**
+     * Re-registers an existing TCP stream registration with updated interest.
+     *
+     * @param stream The registered stream.
+     * @param token Registration token.
+     * @param interest Updated interest mask.
+     * @throws IOException If reactor re-registration fails.
+     */
+    void reregisterStream(&mut TcpStream stream, int token, Poller.Interest interest) throws IOException {
+        Runtime.reregisterStream(this.id, stream, token, interest);
+    }
+
+    /**
+     * Deregisters a TCP stream from the runtime reactor.
+     *
+     * @param stream The stream to deregister.
+     * @param token Registration token.
+     * @throws IOException If reactor deregistration fails.
+     */
+    void deregisterStream(&mut TcpStream stream, int token) throws IOException {
+        Runtime.deregisterStream(this.id, stream, token);
+    }
+
+    /**
+     * Deregisters a TCP listener from the runtime reactor.
+     *
+     * @param listener The listener to deregister.
+     * @param token Registration token.
+     * @throws IOException If reactor deregistration fails.
+     */
+    void deregisterListener(&mut TcpListener listener, int token) throws IOException {
+        Runtime.deregisterListener(this.id, listener, token);
+    }
+
+    /**
+     * Registers a UDP socket with the runtime reactor.
+     *
+     * @param socket The UDP socket to register.
+     * @param interest Poller interest mask.
+     * @return Registration token.
+     * @throws IOException If reactor registration fails.
+     */
+    int registerUdp(&mut UdpSocket socket, Poller.Interest interest) throws IOException {
+        return Runtime.registerUdp(this.id, socket, interest);
+    }
+
+    /**
+     * Deregisters a UDP socket from the runtime reactor.
+     *
+     * @param socket The UDP socket to deregister.
+     * @param token Registration token.
+     * @throws IOException If reactor deregistration fails.
+     */
+    void deregisterUdp(&mut UdpSocket socket, int token) throws IOException {
+        Runtime.deregisterUdp(this.id, socket, token);
+    }
+
+    /**
+     * Registers a waker to be notified when the token becomes readable.
+     *
+     * @param token The reactor token.
+     * @param waker Waker to register.
+     */
+    void readWaker(int token, Waker waker) {
+        Runtime.readWaker(this.id, token, waker);
+    }
+
+    /**
+     * Registers a waker to be notified when the token becomes writable.
+     *
+     * @param token The reactor token.
+     * @param waker Waker to register.
+     */
+    void writeWaker(int token, Waker waker) {
+        Runtime.writeWaker(this.id, token, waker);
+    }
+
+    /**
+     * Checks if the token is currently marked readable.
+     *
+     * @param token The reactor token.
+     * @return {@code true} if readable; {@code false} otherwise.
+     */
+    boolean isReadable(int token) {
+        return Runtime.isReadable(this.id, token);
+    }
+
+    /**
+     * Checks if the token is currently marked writable.
+     *
+     * @param token The reactor token.
+     * @return {@code true} if writable; {@code false} otherwise.
+     */
+    boolean isWritable(int token) {
+        return Runtime.isWritable(this.id, token);
+    }
+
+    /**
+     * Clears the readable readiness flag for the token.
+     *
+     * @param token The reactor token.
+     */
+    void clearReadable(int token) {
+        Runtime.clearReadable(this.id, token);
+    }
+
+    /**
+     * Clears the writable readiness flag for the token.
+     *
+     * @param token The reactor token.
+     */
+    void clearWritable(int token) {
+        Runtime.clearWritable(this.id, token);
+    }
+
+    /**
+     * Wakes a suspended task by adding it to the scheduler ready queue.
+     *
+     * @param taskId Task identifier.
+     */
+    void wakeTask(long taskId) {
+        Runtime.wakeTask(this.id, taskId);
+    }
+
+    /**
+     * Aborts execution of the specified task.
+     *
+     * @param taskId Task identifier.
+     */
+    void abortTask(long taskId) {
+        Runtime.abortTask(this.id, taskId);
+    }
+
+    /**
+     * Checks whether the specified task has terminated.
+     *
+     * @param taskId Task identifier.
+     * @return {@code true} if finished; {@code false} otherwise.
+     */
+    boolean isTaskFinished(long taskId) {
+        return Runtime.isTaskFinished(this.id, taskId);
+    }
+
+    /**
+     * Polls the join state of a task for completion.
+     *
+     * @param taskId Task identifier.
+     * @param waker Waker to notify if still pending.
+     * @return Poll result with the value or pending.
+     * @throws Exception If the task threw or was cancelled.
+     */
+    <T> Poll<T> pollJoin(long taskId, &Waker waker) throws Exception {
+        return Runtime.pollJoin(this.id, taskId, waker);
+    }
+
+    /**
+     * Schedules a timer event to wake the waker at the given deadline.
+     *
+     * @param deadline Instant to trigger notification.
+     * @param waker Waker to notify.
+     * @return Timer event identifier.
+     */
+    long scheduleTimer(Instant deadline, Waker waker) {
+        return Runtime.scheduleTimer(this.id, deadline, waker);
+    }
+
+    /**
+     * Returns a snapshot of runtime metrics for this runtime.
+     *
+     * @return Current RuntimeMetrics snapshot.
+     */
+    tide.metrics.RuntimeMetrics metrics() {
+        return Runtime.metrics(this.id);
+    }
+}

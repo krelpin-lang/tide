@@ -1,0 +1,53 @@
+package tide.future;
+
+import std.task.Context;
+import std.task.Future;
+import std.task.Poll;
+
+/**
+ * Future that races two futures concurrently, completing as soon as either one resolves.
+ *
+ * @param <A> First future value type.
+ * @param <B> Second future value type.
+ */
+final class Select2Future<A, B> implements Future<Select2<A, B>> {
+    private Future<A> a;
+    private Future<B> b;
+
+    /**
+     * Constructs a Select2Future wrapping two futures to race.
+     *
+     * @param a First branch future.
+     * @param b Second branch future.
+     */
+    Select2Future(Future<A> a, Future<B> b) {
+        this.a = a;
+        this.b = b;
+    }
+
+    /**
+     * Polls both futures in sequence. Returns ready as soon as one yields a value.
+     *
+     * @param cx Task polling context.
+     * @return {@code Poll.Ready} with {@link Select2} when either completes; {@code Poll.Pending} otherwise.
+     * @throws Exception If either branch throws.
+     */
+    @Override
+    mut Poll<Select2<A, B>> poll(&mut Context cx) throws Exception {
+        Poll<A> pollA = this.a.poll(cx);
+        switch (pollA) {
+            case Poll.Ready(A val) -> {
+                return Poll.Ready(Select2.<A, B>first(val));
+            }
+            case Poll.Pending -> {}
+        }
+        Poll<B> pollB = this.b.poll(cx);
+        switch (pollB) {
+            case Poll.Ready(B val) -> {
+                return Poll.Ready(Select2.<A, B>second(val));
+            }
+            case Poll.Pending -> {}
+        }
+        return Poll.Pending;
+    }
+}

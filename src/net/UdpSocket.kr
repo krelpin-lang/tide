@@ -1,0 +1,135 @@
+package tide.net;
+
+import std.io.IOException;
+import std.net.Poller;
+import std.net.SocketAddr;
+import tide.io.Io;
+import tide.reactor.ReadReady;
+import tide.reactor.WriteReady;
+import tide.runtime.Handle;
+
+/**
+ * Asynchronous UDP socket allowing non-blocking datagram sending and receiving.
+ * Integrated with the runtime reactor.
+ */
+final class UdpSocket {
+    private final int token;
+    private std.net.UdpSocket raw;
+    private boolean closed;
+
+    /**
+     * Constructs a UdpSocket wrapping a raw UDP socket and reactor registration token.
+     *
+     * @param token Reactor registration token.
+     * @param raw Raw network socket.
+     */
+    private UdpSocket(int token, std.net.UdpSocket raw) {
+        this.token = token;
+        this.raw = raw;
+        this.closed = false;
+    }
+
+    /**
+     * Binds a new UDP socket to the specified local address.
+     *
+     * @param address Local address string (e.g. "127.0.0.1:0").
+     * @return Bound UdpSocket instance.
+     * @throws IOException If bind fails.
+     */
+    static async UdpSocket bind(String address) throws IOException {
+        std.net.UdpSocket raw = std.net.UdpSocket.bind(address);
+        int token = Handle.current().registerUdp(&mut raw, Poller.Interest.READ_WRITE);
+        return new UdpSocket(token, raw);
+    }
+
+    /**
+     * Asynchronously transmits a datagram to the specified destination address.
+     *
+     * @param data Byte payload to transmit.
+     * @param address Destination address string.
+     * @return {@code true} when sent.
+     * @throws IOException If transmission fails.
+     */
+    mut async boolean sendTo(&byte[] data, String address) throws IOException {
+        while (true) {
+            if (this.raw.trySend(data, address)) {
+                return true;
+            }
+            Handle.current().clearWritable(this.token);
+            await new WriteReady(this.token);
+        }
+    }
+
+    /**
+     * Asynchronously transmits a text string as a UTF-8 datagram.
+     *
+     * @param text Text to transmit.
+     * @param address Destination address string.
+     * @throws IOException If transmission fails.
+     */
+    mut async void sendText(String text, String address) throws IOException {
+        byte[] data = text.bytes();
+        await this.sendTo(&data, address);
+    }
+
+    /**
+     * Asynchronously receives a datagram packet.
+     *
+     * @param max Maximum packet size in bytes.
+     * @return Received Datagram containing bytes and sender SocketAddr.
+     * @throws IOException If receive fails.
+     */
+    mut async Datagram receiveFrom(int max) throws IOException {
+        while (true) {
+            std.net.UdpSocket.Datagram? d = this.raw.tryReceive(max);
+            if (d != null) {
+                byte[] copy = new byte[d.data().length];
+                Io.copyBytes(d.data(), 0, &mut copy, 0, d.data().length);
+                return new Datagram(copy, d.sender());
+            }
+            Handle.current().clearReadable(this.token);
+            await new ReadReady(this.token);
+        }
+    }
+
+    /**
+     * Returns the local bound socket address.
+     *
+     * @return Local SocketAddr.
+     * @throws IOException If retrieving address fails.
+     */
+    SocketAddr localAddr() throws IOException {
+        return this.raw.localAddr();
+    }
+
+    /**
+     * Closes the socket and deregisters it from the runtime reactor.
+     */
+    mut void close() {
+        if (this.closed) {
+            return;
+        }
+        this.closed = true;
+        try {
+            Handle.current().deregisterUdp(&mut this.raw, this.token);
+        } catch (IOException e) {}
+    }
+
+    /**
+     * A received datagram packet with its data payload and sender address.
+     *
+     * @param bytes Datagram byte payload.
+     * @param sender Originating socket address.
+     */
+    record Datagram(byte[] bytes, SocketAddr sender) {
+        /**
+         * Decodes the datagram payload as a UTF-8 string.
+         *
+         * @return Decoded string.
+         */
+        String text() {
+            String? decoded = String.fromUtf8(&this.bytes);
+            return decoded ?: "";
+        }
+    }
+}

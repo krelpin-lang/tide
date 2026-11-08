@@ -1,0 +1,148 @@
+package tide.sync;
+
+import std.lang.Objects;
+import std.task.Poll;
+import std.task.Waker;
+import std.util.ArrayDeque;
+import std.util.Queue;
+
+/**
+ * An asynchronous mutual exclusion primitive for protecting shared data across tasks.
+ * When locked, callers receive a {@link MutexGuard} which automatically unlocks
+ * the mutex upon exit via {@link std.lang.AutoCloseable}.
+ *
+ * @param <T> Protected data type.
+ */
+final class Mutex<T> {
+    private final std.sync.Mutex<State<T>> inner;
+
+    /**
+     * Internal state container for the asynchronous mutex.
+     *
+     * @param <T> Protected data type.
+     */
+    private static final class State<T> {
+        T value;
+        boolean locked;
+        Queue<Waker> waiters;
+
+        /**
+         * Constructs initial unlocked mutex state.
+         *
+         * @param value Initial protected value.
+         */
+        State(T value) {
+            this.value = value;
+            this.locked = false;
+            this.waiters = new ArrayDeque<>();
+        }
+    }
+
+    /**
+     * Constructs an asynchronous Mutex guarding the specified initial value.
+     *
+     * @param value Initial protected value.
+     */
+    Mutex(T value) {
+        this.inner = new std.sync.Mutex<>(new State<>(value));
+    }
+
+    /**
+     * Asynchronously acquires the lock, returning a future that resolves to a {@link MutexGuard}.
+     *
+     * @return LockFuture yielding MutexGuard.
+     */
+    LockFuture<T> lock() borrows this {
+        return new LockFuture<>(this);
+    }
+
+    /**
+     * Polls acquisition of the mutex lock.
+     *
+     * @param registered Whether caller's waker has been enqueued in the waiter queue.
+     * @param waker Task waker to awaken when the lock is released.
+     * @return Ready with MutexGuard if lock acquired; Pending otherwise.
+     */
+    Poll<MutexGuard<T>> pollLock(&mut boolean registered, &Waker waker) borrows this {
+        std.sync.Mutex.Guard<State<T>> guard = this.inner.lock();
+        &mut State<T> s = guard.getMut();
+        if (!s.locked) {
+            s.locked = true;
+            return Poll.Ready(new MutexGuard<>(this));
+        }
+        if (!registered) {
+            s.waiters.add(waker.copy());
+            registered = true;
+        }
+        return Poll.Pending;
+    }
+
+    /**
+     * Releases the mutex lock and awakens the next queued waiting task.
+     */
+    void unlock() {
+        Waker? next = null;
+        {
+            std.sync.Mutex.Guard<State<T>> guard = this.inner.lock();
+            &mut State<T> s = guard.getMut();
+            if (s.waiters.size() > 0) {
+                next = s.waiters.remove();
+            } else {
+                s.locked = false;
+            }
+        }
+        if (next != null) {
+            next.wake();
+        }
+    }
+
+    /**
+     * Functional callback to mutate protected value in-place.
+     *
+     * @param <T> Value type.
+     */
+    interface Action<T> {
+        void run(&mut T value);
+    }
+
+    /**
+     * Functional callback to map protected value to a transformed result.
+     *
+     * @param <T> Value type.
+     * @param <R> Return type.
+     */
+    interface Func<T, R> {
+        R apply(&mut T value);
+    }
+
+    /**
+     * Mutates the protected value with the given action while holding the internal lock.
+     *
+     * @param action Mutation callback.
+     */
+    void modify(Action<T> action) {
+        std.sync.Mutex.Guard<State<T>> guard = this.inner.lock();
+        action.run(&mut guard.getMut().value);
+    }
+
+    /**
+     * Replaces the protected value with a new value while holding the internal lock.
+     *
+     * @param val New value.
+     */
+    void set(T val) {
+        std.sync.Mutex.Guard<State<T>> guard = this.inner.lock();
+        Objects.replace(&mut guard.getMut().value, val);
+    }
+
+    /**
+     * Inspects or transforms the protected value with the given function while holding the internal lock.
+     *
+     * @param func Transformation callback.
+     * @return Computed result.
+     */
+    <R> R map(Func<T, R> func) {
+        std.sync.Mutex.Guard<State<T>> guard = this.inner.lock();
+        return func.apply(&mut guard.getMut().value);
+    }
+}

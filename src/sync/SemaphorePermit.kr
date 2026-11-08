@@ -1,0 +1,55 @@
+package tide.sync;
+
+import std.lang.AutoCloseable;
+
+/**
+ * RAII guard representing one or more permits acquired from a {@link Semaphore}.
+ * Releases all acquired permits back to the semaphore upon being dropped via {@link AutoCloseable}.
+ */
+final class SemaphorePermit borrows semaphore implements AutoCloseable {
+    private final &Semaphore semaphore;
+    private int count;
+
+    /**
+     * Constructs a SemaphorePermit holding the specified number of permits.
+     *
+     * @param semaphore Parent semaphore.
+     * @param count Number of acquired permits.
+     */
+    SemaphorePermit(&Semaphore semaphore, int count) keeps semaphore {
+        this.semaphore = semaphore;
+        this.count = count;
+    }
+
+    /**
+     * Returns the number of permits held by this permit guard.
+     *
+     * @return Number of held permits.
+     */
+    int count() {
+        return this.count;
+    }
+
+    /**
+     * Automatically invoked when dropped, releasing the held permits back to the semaphore.
+     */
+    @Override
+    mut void close() {
+        if (this.count > 0) {
+            int c = this.count;
+            this.count = 0;
+            this.semaphore.release(c);
+        }
+    }
+
+    /**
+     * Explicitly releases the held permits back to the semaphore early before leaving scope.
+     */
+    mut void releaseEarly() {
+        if (this.count > 0) {
+            int c = this.count;
+            this.count = 0;
+            this.semaphore.release(c);
+        }
+    }
+}

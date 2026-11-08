@@ -1,0 +1,245 @@
+package tide.sync;
+
+import std.lang.Objects;
+import std.task.Poll;
+import std.task.Waker;
+import std.util.ArrayDeque;
+import std.util.Queue;
+
+/**
+ * An asynchronous reader-writer lock allowing concurrent read access or exclusive write access.
+ * Implements writer fairness by prioritizing pending writers over new readers.
+ *
+ * @param <T> Protected data type.
+ */
+final class RwLock<T> {
+    private final std.sync.Mutex<State<T>> inner;
+
+    /**
+     * Internal state container for the reader-writer lock.
+     *
+     * @param <T> Protected data type.
+     */
+    private static final class State<T> {
+        T value;
+        int readers;
+        boolean writer;
+        Queue<Waker> readWaiters;
+        Queue<Waker> writeWaiters;
+
+        /**
+         * Constructs initial unlocked RwLock state.
+         *
+         * @param value Initial protected value.
+         */
+        State(T value) {
+            this.value = value;
+            this.readers = 0;
+            this.writer = false;
+            this.readWaiters = new ArrayDeque<>();
+            this.writeWaiters = new ArrayDeque<>();
+        }
+    }
+
+    /**
+     * Constructs an RwLock protecting the given initial value.
+     *
+     * @param value Initial protected value.
+     */
+    RwLock(T value) {
+        this.inner = new std.sync.Mutex<>(new State<>(value));
+    }
+
+    /**
+     * Asynchronously acquires shared read access, returning an {@link RwLockReadGuard}.
+     *
+     * @return Future resolving to an RwLockReadGuard.
+     */
+    RwLockReadFuture<T> read() borrows this {
+        return new RwLockReadFuture<>(this);
+    }
+
+    /**
+     * Asynchronously acquires exclusive write access, returning an {@link RwLockWriteGuard}.
+     *
+     * @return Future resolving to an RwLockWriteGuard.
+     */
+    RwLockWriteFuture<T> write() borrows this {
+        return new RwLockWriteFuture<>(this);
+    }
+
+    /**
+     * Polls acquisition of shared read access.
+     *
+     * @param registered Whether caller's waker has been enqueued in the read waiter queue.
+     * @param waker Task waker to awaken when read access becomes available.
+     * @return Ready with RwLockReadGuard if acquired; Pending otherwise.
+     */
+    Poll<RwLockReadGuard<T>> pollRead(&mut boolean registered, &Waker waker) borrows this {
+        std.sync.Mutex.Guard<State<T>> guard = this.inner.lock();
+        &mut State<T> s = guard.getMut();
+        if (!s.writer && s.writeWaiters.size() == 0) {
+            s.readers++;
+            return Poll.Ready(new RwLockReadGuard<>(this));
+        }
+        if (!registered) {
+            s.readWaiters.add(waker.copy());
+            registered = true;
+        }
+        return Poll.Pending;
+    }
+
+    /**
+     * Polls acquisition of exclusive write access.
+     *
+     * @param registered Whether caller's waker has been enqueued in the write waiter queue.
+     * @param waker Task waker to awaken when write access becomes available.
+     * @return Ready with RwLockWriteGuard if acquired; Pending otherwise.
+     */
+    Poll<RwLockWriteGuard<T>> pollWrite(&mut boolean registered, &Waker waker) borrows this {
+        std.sync.Mutex.Guard<State<T>> guard = this.inner.lock();
+        &mut State<T> s = guard.getMut();
+        if (s.readers == 0 && !s.writer) {
+            s.writer = true;
+            return Poll.Ready(new RwLockWriteGuard<>(this));
+        }
+        if (!registered) {
+            s.writeWaiters.add(waker.copy());
+            registered = true;
+        }
+        return Poll.Pending;
+    }
+
+    /**
+     * Releases shared read access and awakens a waiting writer if active reader count drops to zero.
+     */
+    void unlockRead() {
+        Waker? nextWriter = null;
+        {
+            std.sync.Mutex.Guard<State<T>> guard = this.inner.lock();
+            &mut State<T> s = guard.getMut();
+            s.readers--;
+            if (s.readers == 0 && s.writeWaiters.size() > 0) {
+                nextWriter = s.writeWaiters.remove();
+            }
+        }
+        if (nextWriter != null) {
+            nextWriter.wake();
+        }
+    }
+
+    /**
+     * Releases exclusive write access and awakens waiting writers or queued readers.
+     */
+    void unlockWrite() {
+        Waker? nextWriter = null;
+        Queue<Waker>? nextReaders = null;
+        {
+            std.sync.Mutex.Guard<State<T>> guard = this.inner.lock();
+            &mut State<T> s = guard.getMut();
+            s.writer = false;
+            if (s.writeWaiters.size() > 0) {
+                nextWriter = s.writeWaiters.remove();
+            } else if (s.readWaiters.size() > 0) {
+                nextReaders = Objects.replace(&mut s.readWaiters, new ArrayDeque<>());
+            }
+        }
+        if (nextWriter != null) {
+            nextWriter.wake();
+        } else if (nextReaders != null) {
+            while (nextReaders.size() > 0) {
+                nextReaders.remove().wake();
+            }
+        }
+    }
+
+    /**
+     * Mutating callback holding exclusive access.
+     *
+     * @param <T> Value type.
+     */
+    interface Action<T> {
+        /**
+         * Mutates the protected value.
+         *
+         * @param value Mutable reference to protected value.
+         */
+        void run(&mut T value);
+    }
+
+    /**
+     * Transforming callback holding exclusive access.
+     *
+     * @param <T> Value type.
+     * @param <R> Return type.
+     */
+    interface Func<T, R> {
+        /**
+         * Applies a transformation on the mutable protected value.
+         *
+         * @param value Mutable reference to protected value.
+         * @return Computed result.
+         */
+        R apply(&mut T value);
+    }
+
+    /**
+     * Inspecting callback holding read-only access.
+     *
+     * @param <T> Value type.
+     * @param <R> Return type.
+     */
+    interface ReadFunc<T, R> {
+        /**
+         * Reads the protected value.
+         *
+         * @param value Read-only reference to protected value.
+         * @return Computed result.
+         */
+        R apply(&T value);
+    }
+
+    /**
+     * Inspects the protected value under shared read access.
+     *
+     * @param <R> Return type.
+     * @param func Inspection callback.
+     * @return Computed result.
+     */
+    <R> R readMap(ReadFunc<T, R> func) {
+        std.sync.Mutex.Guard<State<T>> guard = this.inner.lock();
+        return func.apply(&guard.get().value);
+    }
+
+    /**
+     * Mutates the protected value under exclusive write access.
+     *
+     * @param action Mutating callback.
+     */
+    void modify(Action<T> action) {
+        std.sync.Mutex.Guard<State<T>> guard = this.inner.lock();
+        action.run(&mut guard.getMut().value);
+    }
+
+    /**
+     * Replaces the protected value with a new value under exclusive write access.
+     *
+     * @param val New value to store.
+     */
+    void set(T val) {
+        std.sync.Mutex.Guard<State<T>> guard = this.inner.lock();
+        Objects.replace(&mut guard.getMut().value, val);
+    }
+
+    /**
+     * Computes a result from the protected value while holding exclusive write access.
+     *
+     * @param <R> Return type.
+     * @param func Transforming callback.
+     * @return Computed result.
+     */
+    <R> R writeMap(Func<T, R> func) {
+        std.sync.Mutex.Guard<State<T>> guard = this.inner.lock();
+        return func.apply(&mut guard.getMut().value);
+    }
+}

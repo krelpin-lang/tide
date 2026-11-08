@@ -1,0 +1,118 @@
+package tide.time;
+
+import std.time.Duration;
+import std.time.Instant;
+
+/**
+ * Periodic interval timer that ticks asynchronously at regular duration periods.
+ * Configurable with {@link MissedTickBehavior} to control behavior when ticks fall behind.
+ */
+final class Interval {
+    private final Duration period;
+    private MissedTickBehavior behavior;
+    private Instant nextTick;
+
+    /**
+     * Constructs an Interval ticking at the given period with the specified catch-up behavior.
+     *
+     * @param period Period duration between ticks.
+     * @param behavior Strategy for missed ticks.
+     */
+    Interval(Duration period, MissedTickBehavior behavior) {
+        this.period = period;
+        this.behavior = behavior;
+        this.nextTick = Instant.now().plus(period);
+    }
+
+    /**
+     * Constructs an Interval ticking at the given period with default {@link MissedTickBehavior#BURST}.
+     *
+     * @param period Period duration between ticks.
+     */
+    Interval(Duration period) {
+        this(period, MissedTickBehavior.BURST);
+    }
+
+    /**
+     * Creates an Interval ticking every specified duration.
+     *
+     * @param period Period between ticks.
+     * @return A new Interval instance.
+     */
+    static Interval every(Duration period) {
+        return new Interval(period);
+    }
+
+    /**
+     * Creates an Interval ticking every specified milliseconds.
+     *
+     * @param millis Millisecond interval between ticks.
+     * @return A new Interval instance.
+     */
+    static Interval everyMillis(long millis) {
+        return new Interval(Duration.ofMillis(millis));
+    }
+
+    /**
+     * Updates the missed tick behavior policy for this interval.
+     *
+     * @param behavior The updated strategy.
+     */
+    mut void behavior(MissedTickBehavior behavior) {
+        this.behavior = behavior;
+    }
+
+    /**
+     * Returns the currently configured missed tick behavior strategy.
+     *
+     * @return Active MissedTickBehavior.
+     */
+    MissedTickBehavior behavior() {
+        return this.behavior;
+    }
+
+    /**
+     * Returns the configured interval period duration.
+     *
+     * @return Period duration.
+     */
+    Duration period() {
+        return this.period;
+    }
+
+    /**
+     * Returns the target instant for the next upcoming tick.
+     *
+     * @return Next tick instant.
+     */
+    Instant nextTick() {
+        return this.nextTick;
+    }
+
+    /**
+     * Asynchronously awaits the next tick of this interval.
+     *
+     * @return The Instant when the tick fired.
+     */
+    mut async Instant tick() {
+        await Sleep.until(this.nextTick);
+        Instant fired = this.nextTick;
+        Instant now = Instant.now();
+        switch (this.behavior) {
+            case BURST -> {
+                this.nextTick = this.nextTick.plus(this.period);
+            }
+            case DELAY -> {
+                this.nextTick = now.plus(this.period);
+            }
+            case SKIP -> {
+                Instant next = this.nextTick.plus(this.period);
+                while (!next.isAfter(now)) {
+                    next = next.plus(this.period);
+                }
+                this.nextTick = next;
+            }
+        }
+        return fired;
+    }
+}

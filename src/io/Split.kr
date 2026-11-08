@@ -1,0 +1,149 @@
+package tide.io;
+
+import std.io.IOException;
+import std.sync.Mutex;
+import std.task.Unit;
+
+/**
+ * Splits a bidirectional asynchronous stream into separate {@link ReadHalf} and {@link WriteHalf}
+ * instances that can be owned and used concurrently.
+ *
+ * @param <S> Bidirectional stream type implementing both {@link AsyncRead} and {@link AsyncWrite}.
+ */
+final class Split<S extends AsyncRead & AsyncWrite> {
+    private final Mutex<S> stream;
+
+    /**
+     * Constructs a Split wrapper around the bidirectional stream.
+     *
+     * @param stream The stream to split.
+     */
+    Split(S stream) {
+        this.stream = new Mutex<>(stream);
+    }
+
+    /**
+     * Borrows the read half of the split stream.
+     *
+     * @return ReadHalf instance.
+     */
+    ReadHalf<S> readHalf() borrows this {
+        return new ReadHalf<>(this);
+    }
+
+    /**
+     * Borrows the write half of the split stream.
+     *
+     * @return WriteHalf instance.
+     */
+    WriteHalf<S> writeHalf() borrows this {
+        return new WriteHalf<>(this);
+    }
+
+    /**
+     * Reads up to maxBytes from the underlying shared stream under mutex protection.
+     *
+     * @param maxBytes Maximum bytes to read.
+     * @return Byte array containing read data.
+     * @throws Exception If reading from stream fails.
+     */
+    async byte[] readFromStream(int maxBytes) throws Exception {
+        Mutex.Guard<S> guard = this.stream.lock();
+        return await guard.getMut().read(maxBytes);
+    }
+
+    /**
+     * Writes bytes to the underlying shared stream under mutex protection.
+     *
+     * @param bytes Bytes to write.
+     * @return Number of bytes written.
+     * @throws Exception If writing to stream fails.
+     */
+    async int writeToStream(&byte[] bytes) throws Exception {
+        Mutex.Guard<S> guard = this.stream.lock();
+        return await guard.getMut().write(bytes);
+    }
+
+    /**
+     * Flushes buffered bytes in the underlying stream under mutex protection.
+     *
+     * @return Completed Unit.
+     * @throws Exception If flushing fails.
+     */
+    async Unit flushStream() throws Exception {
+        Mutex.Guard<S> guard = this.stream.lock();
+        await guard.getMut().flush();
+        return new Unit();
+    }
+
+    /**
+     * Asynchronous read half of a split stream.
+     *
+     * @param <S> Underlying stream type.
+     */
+    static final class ReadHalf<S extends AsyncRead & AsyncWrite> borrows split implements AsyncRead {
+        private final &Split<S> split;
+
+        /**
+         * Constructs a ReadHalf borrowing the parent Split handle.
+         *
+         * @param split Parent Split handle.
+         */
+        ReadHalf(&Split<S> split) keeps split {
+            this.split = split;
+        }
+
+        /**
+         * Reads up to maxBytes from the stream's read half.
+         *
+         * @param maxBytes Maximum bytes to read.
+         * @return Byte array containing read data.
+         * @throws Exception If reading fails.
+         */
+        @Override
+        mut async byte[] read(int maxBytes) throws Exception {
+            return await this.split.readFromStream(maxBytes);
+        }
+    }
+
+    /**
+     * Asynchronous write half of a split stream.
+     *
+     * @param <S> Underlying stream type.
+     */
+    static final class WriteHalf<S extends AsyncRead & AsyncWrite> borrows split implements AsyncWrite {
+        private final &Split<S> split;
+
+        /**
+         * Constructs a WriteHalf borrowing the parent Split handle.
+         *
+         * @param split Parent Split handle.
+         */
+        WriteHalf(&Split<S> split) keeps split {
+            this.split = split;
+        }
+
+        /**
+         * Writes bytes through the stream's write half.
+         *
+         * @param bytes Bytes to write.
+         * @return Number of bytes written.
+         * @throws Exception If writing fails.
+         */
+        @Override
+        mut async int write(&byte[] bytes) throws Exception {
+            return await this.split.writeToStream(bytes);
+        }
+
+        /**
+         * Flushes buffered bytes through the stream's write half.
+         *
+         * @return Completed Unit.
+         * @throws Exception If flushing fails.
+         */
+        @Override
+        mut async Unit flush() throws Exception {
+            return await this.split.flushStream();
+        }
+    }
+}

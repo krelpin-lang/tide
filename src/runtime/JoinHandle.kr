@@ -1,0 +1,66 @@
+package tide.runtime;
+
+import std.task.Context;
+import std.task.Future;
+import std.task.Poll;
+import std.task.Waker;
+
+/**
+ * Handle to an asynchronous task spawned onto a Tide runtime.
+ * Implements {@code Future<T>}, allowing callers to await the task result.
+ * Supports cancellation via {@link #abort()} and completion status checks via {@link #isFinished()}.
+ *
+ * @param <T> The return type of the asynchronous task.
+ */
+final class JoinHandle<T> implements Future<T> {
+    private final long taskId;
+
+    /**
+     * Creates a new JoinHandle referencing the specified task identifier.
+     *
+     * @param taskId Unique identifier of the scheduled task.
+     */
+    JoinHandle(long taskId) {
+        this.taskId = taskId;
+    }
+
+    /**
+     * Returns the unique identifier of the associated task.
+     *
+     * @return The task identifier.
+     */
+    long taskId() {
+        return this.taskId;
+    }
+
+    /**
+     * Aborts execution of the associated task. If the task is pending,
+     * it will not be executed; if currently executing, awaiting this handle
+     * will yield a {@link CancellationException}.
+     */
+    void abort() {
+        Handle.current().abortTask(this.taskId);
+    }
+
+    /**
+     * Checks whether the task has completed execution (successfully, exceptionally, or via abort).
+     *
+     * @return {@code true} if the task has terminated; {@code false} otherwise.
+     */
+    boolean isFinished() {
+        return Handle.current().isTaskFinished(this.taskId);
+    }
+
+    /**
+     * Polls the task for completion.
+     *
+     * @param cx Context providing the task waker.
+     * @return {@code Poll.Ready} with the result when done, or {@code Poll.Pending}.
+     * @throws Exception If the task completed with an uncaught exception or was aborted.
+     */
+    @Override
+    mut Poll<T> poll(&mut Context cx) throws Exception {
+        Waker waker = cx.waker();
+        return Handle.current().pollJoin(this.taskId, &waker);
+    }
+}

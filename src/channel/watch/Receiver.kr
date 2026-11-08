@@ -1,0 +1,66 @@
+package tide.channel.watch;
+
+import std.task.Poll;
+import std.task.Unit;
+import std.task.Waker;
+
+/**
+ * Receiving endpoint of a {@link Watch} channel. Receivers can inspect the current value
+ * via {@link #map(Watch.Func)} and wait for future updates via {@link #changed()}.
+ *
+ * @param <T> Watched state type.
+ */
+final class Receiver<T> borrows channel {
+    private final &Watch<T> channel;
+    private long lastVersion;
+
+    /**
+     * Constructs a Receiver borrowing the parent watch channel starting at the given version.
+     *
+     * @param channel Parent watch channel.
+     * @param version Starting seen version.
+     */
+    Receiver(&Watch<T> channel, long version) keeps channel {
+        this.channel = channel;
+        this.lastVersion = version;
+    }
+
+    /**
+     * Returns a future that resolves when the watched value changes to a new version.
+     *
+     * @return ChangedFuture resolving with {@link Unit}.
+     */
+    mut ChangedFuture<T> changed() borrows this {
+        return new ChangedFuture<>(this);
+    }
+
+    /**
+     * Polls whether the watched channel state has changed since this receiver's last observed version.
+     *
+     * @param registered Whether caller's waker has been enqueued.
+     * @param waker Task waker to awaken when state version advances.
+     * @return Ready with Unit if changed; Pending otherwise.
+     */
+    mut Poll<Unit> pollChanged(&mut boolean registered, &Waker waker) borrows this {
+        return this.channel.pollChanged(&mut this.lastVersion, registered, waker);
+    }
+
+    /**
+     * Inspects the current state value without awaiting a change.
+     *
+     * @param func Inspection callback.
+     * @return Computed result.
+     */
+    <R> R map(Watch.Func<T, R> func) {
+        return this.channel.map(func);
+    }
+
+    /**
+     * Clones this receiver handle to observe future changes independently.
+     *
+     * @return Cloned Receiver instance.
+     */
+    Receiver<T> copy() borrows this {
+        return new Receiver<>(this.channel, this.lastVersion);
+    }
+}

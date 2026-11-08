@@ -1,0 +1,78 @@
+package tide.future;
+
+import std.task.Future;
+import std.util.ArrayList;
+import std.util.List;
+import tide.Tide;
+import tide.runtime.JoinHandle;
+
+/**
+ * Combinator utility for concurrently joining multiple futures and waiting for all to complete.
+ */
+final class Join {
+    /**
+     * Prevents direct instantiation of this static utility class.
+     */
+    private Join() {}
+
+    /**
+     * Concurrently runs two futures to completion and returns their combined results as a {@link Pair}.
+     *
+     * @param <A> First future value type.
+     * @param <B> Second future value type.
+     * @param a First future.
+     * @param b Second future.
+     * @return Pair containing both resolved values.
+     * @throws Exception If either future throws.
+     */
+    static async <A, B> Pair<A, B> join(Future<A> a, Future<B> b) keeps a, b throws Exception {
+        JoinHandle<A> hA = Tide.spawn(a);
+        JoinHandle<B> hB = Tide.spawn(b);
+        A aVal = await hA;
+        B bVal = await hB;
+        return new Pair<>(aVal, bVal);
+    }
+
+    /**
+     * Concurrently runs three futures to completion and returns their combined results as a {@link Tuple3}.
+     *
+     * @param <A> First future value type.
+     * @param <B> Second future value type.
+     * @param <C> Third future value type.
+     * @param a First future.
+     * @param b Second future.
+     * @param c Third future.
+     * @return Tuple3 containing all three resolved values.
+     * @throws Exception If any future throws.
+     */
+    static async <A, B, C> Tuple3<A, B, C> join3(Future<A> a, Future<B> b, Future<C> c) keeps a, b, c throws Exception {
+        JoinHandle<A> hA = Tide.spawn(a);
+        JoinHandle<B> hB = Tide.spawn(b);
+        JoinHandle<C> hC = Tide.spawn(c);
+        A aVal = await hA;
+        B bVal = await hB;
+        C cVal = await hC;
+        return new Tuple3<>(aVal, bVal, cVal);
+    }
+
+    /**
+     * Concurrently runs a list of futures to completion, returning all results in corresponding order.
+     *
+     * @param <T> Future value type.
+     * @param futures List of futures to execute.
+     * @return List containing all resolved values in order.
+     * @throws Exception If any future throws.
+     */
+    static async <T> List<T> joinAll(List<Future<T>> futures) keeps futures throws Exception {
+        List<Future<T>> input = futures;
+        List<JoinHandle<T>> handles = new ArrayList<>();
+        while (input.size() > 0) {
+            handles.add(Tide.spawn(input.remove(0)));
+        }
+        List<T> results = new ArrayList<>();
+        while (handles.size() > 0) {
+            results.add(await handles.remove(0));
+        }
+        return results;
+    }
+}

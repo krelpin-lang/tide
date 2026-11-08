@@ -1,0 +1,43 @@
+package tide.channel.mpsc;
+
+import std.io.IOException;
+import std.task.Context;
+import std.task.Future;
+import std.task.Poll;
+import std.task.Unit;
+
+/**
+ * Future returned by {@link Sender#send(Object)}, resolving once the message has been
+ * enqueued into the channel buffer.
+ *
+ * @param <T> Transferred message type.
+ */
+final class SendFuture<T> borrows channel implements Future<Unit> {
+    private final &Mpsc<T> channel;
+    private T? value;
+    private boolean registered;
+
+    /**
+     * Constructs a SendFuture borrowing the parent MPSC channel and holding the value to enqueue.
+     *
+     * @param channel Parent MPSC channel.
+     * @param value Value to transmit.
+     */
+    SendFuture(&Mpsc<T> channel, T value) keeps channel {
+        this.channel = channel;
+        this.value = value;
+        this.registered = false;
+    }
+
+    /**
+     * Polls the channel to deliver the message.
+     *
+     * @param cx Task polling context.
+     * @return {@code Poll.Ready} when accepted; {@code Poll.Pending} if queue is at capacity.
+     * @throws IOException If the channel is closed.
+     */
+    @Override
+    mut Poll<Unit> poll(&mut Context cx) throws IOException {
+        return this.channel.pollSend(&mut this.value, &mut this.registered, cx.waker());
+    }
+}

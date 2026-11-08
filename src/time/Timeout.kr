@@ -1,0 +1,96 @@
+package tide.time;
+
+import std.task.Context;
+import std.task.Future;
+import std.task.Poll;
+import std.task.Unit;
+import std.time.Duration;
+
+/**
+ * Future that decorates an underlying future with a maximum execution deadline.
+ * If the inner future completes first, its result is returned; if the timer elapses first,
+ * the inner future is cancelled and a {@link TimeoutException} is thrown.
+ *
+ * @param <T> The return type of the wrapped future.
+ */
+final class Timeout<T> implements Future<T> {
+    private Future<T>? future;
+    private Sleep sleep;
+
+    /**
+     * Constructs a Timeout wrapping the specified future with a duration.
+     *
+     * @param future The underlying future.
+     * @param duration Maximum allowed execution time.
+     */
+    Timeout(Future<T> future, Duration duration) {
+        this.future = future;
+        this.sleep = Sleep.after(duration);
+    }
+
+    /**
+     * Constructs a Timeout wrapping the specified future with a millisecond limit.
+     *
+     * @param future The underlying future.
+     * @param millis Maximum allowed execution time in milliseconds.
+     */
+    Timeout(Future<T> future, long millis) {
+        this.future = future;
+        this.sleep = Sleep.afterMillis(millis);
+    }
+
+    /**
+     * Wraps a future with an execution timeout duration.
+     *
+     * @param duration Maximum duration.
+     * @param future The target future.
+     * @return A Timeout future.
+     */
+    static <T> Timeout<T> after(Duration duration, Future<T> future) keeps future {
+        return new Timeout<>(future, duration);
+    }
+
+    /**
+     * Wraps a future with an execution timeout in milliseconds.
+     *
+     * @param millis Maximum duration in milliseconds.
+     * @param future The target future.
+     * @return A Timeout future.
+     */
+    static <T> Timeout<T> afterMillis(long millis, Future<T> future) keeps future {
+        return new Timeout<>(future, millis);
+    }
+
+    /**
+     * Polls the timeout future, racing the underlying future against the sleep deadline.
+     *
+     * @param cx Context providing the task waker.
+     * @return {@code Poll.Ready} if the inner future completes.
+     * @throws Exception If the inner future throws or if timeout expires (TimeoutException).
+     */
+    @Override
+    mut Poll<T> poll(&mut Context cx) throws Exception {
+        if (this.future == null) {
+            throw new TimeoutException("future timed out");
+        }
+        Poll<T>? poll = this.future?.poll(cx);
+        if (poll != null) {
+            switch (poll) {
+                case Ready(T value) -> {
+                    return Poll.Ready(value);
+                }
+                case Pending -> {}
+            }
+        }
+        Poll<Unit> sleepPoll = this.sleep.poll(cx);
+        switch (sleepPoll) {
+            case Ready(Unit unit) -> {
+                Objects.take(&mut this.future);
+                throw new TimeoutException("future timed out");
+            }
+            case Pending -> {
+                return Poll.Pending;
+            }
+        }
+    }
+}

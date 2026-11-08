@@ -1,0 +1,77 @@
+package tide.runtime;
+
+import std.sync.AtomicBool;
+import std.sync.Mutex;
+import std.util.ArrayDeque;
+
+/**
+ * Dedicated thread pool for offloading synchronous blocking computations
+ * (such as file I/O or CPU-heavy tasks) without starving asynchronous scheduler workers.
+ */
+final class BlockingPool {
+    private final Mutex<ArrayDeque<TaskRunner>> queue;
+    private final AtomicBool shutdownFlag;
+
+    /**
+     * Creates a new blocking task queue.
+     */
+    BlockingPool() {
+        this.queue = new Mutex<>(new ArrayDeque<>());
+        this.shutdownFlag = new AtomicBool(false);
+    }
+
+    /**
+     * Submits a runnable task onto the blocking work queue.
+     *
+     * @param runner The task runner to execute.
+     */
+    void submit(TaskRunner runner) {
+        if (this.shutdownFlag.get()) {
+            return;
+        }
+        Mutex.Guard<ArrayDeque<TaskRunner>> guard = this.queue.lock();
+        guard.getMut().addLast(runner);
+    }
+
+    /**
+     * Dequeues the next pending blocking task if available.
+     *
+     * @return The next task runner, or {@code null} if empty.
+     */
+    TaskRunner? takeTask() {
+        Mutex.Guard<ArrayDeque<TaskRunner>> guard = this.queue.lock();
+        if (guard.get().isEmpty()) {
+            return null;
+        }
+        return guard.getMut().removeFirst();
+    }
+
+    /**
+     * Returns the current number of pending tasks waiting in the blocking queue.
+     *
+     * @return Queue depth.
+     */
+    int queueDepth() {
+        Mutex.Guard<ArrayDeque<TaskRunner>> guard = this.queue.lock();
+        return guard.get().size();
+    }
+
+    /**
+     * Initiates shutdown of the blocking pool and discards queued tasks.
+     */
+    mut void shutdown() {
+        this.shutdownFlag.set(true);
+        Mutex.Guard<ArrayDeque<TaskRunner>> guard = this.queue.lock();
+        guard.getMut().clear();
+    }
+
+    /**
+     * Unit of work executed by a dedicated blocking worker thread.
+     */
+    interface TaskRunner {
+        /**
+         * Runs the task.
+         */
+        mut void run();
+    }
+}

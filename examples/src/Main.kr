@@ -1,0 +1,36 @@
+package examples;
+
+import std.lang.Console;
+
+/**
+ * Entry point for running Tide async runtime examples.
+ */
+final class Main {
+    /**
+     * Prevents direct instantiation of this main runner.
+     */
+    private Main() {}
+
+    /**
+     * Program entry point dispatching to specified example.
+     *
+     * @param args Command-line arguments.
+     * @throws Exception If running an example fails.
+     */
+    static void main(String[] args) throws Exception {
+        if (args.length == 0) {
+            Console.println("Usage: krelp run -- <echo|chat|client>");
+            return;
+        }
+        String choice = args[0];
+        if (choice == "echo") {
+            EchoServer.runExample();
+        } else if (choice == "chat") {
+            ChatServer.runExample();
+        } else if (choice == "client") {
+            ClientSelect.runExample();
+        } else {
+            Console.println("Unknown example: $choice (available: echo, chat, client)");
+        }
+    }
+}

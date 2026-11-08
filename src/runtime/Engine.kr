@@ -1,0 +1,1156 @@
+package tide.runtime;
+
+import std.io.IOException;
+import std.lang.Exception;
+import std.lang.IllegalStateException;
+import std.lang.Objects;
+import std.net.Poller;
+import std.net.TcpListener;
+import std.net.TcpStream;
+import std.net.UdpSocket;
+import std.sync.AtomicBool;
+import std.sync.AtomicLong;
+import std.sync.Mutex;
+import std.task.Context;
+import std.task.Future;
+import std.task.Poll;
+import std.task.Waker;
+import std.time.Instant;
+import std.util.ArrayDeque;
+import std.util.ArrayList;
+import std.util.HashMap;
+import std.util.List;
+import std.util.Map;
+import std.util.Queue;
+import tide.reactor.Reactor;
+import tide.time.TimerWheel;
+
+/**
+ * Core event and task orchestration engine for a Tide runtime instance.
+ * Coordinates the cooperative task scheduler run queue, hierarchical timer wheel,
+ * I/O event demultiplexer (Reactor), and blocking worker pool.
+ */
+final class Engine {
+    private final int id;
+    private final boolean enableTimer;
+    private final boolean enableIo;
+    private final Mutex<ArrayDeque<long>> readyQueue;
+    private final Mutex<Map<long, Schedulable>> tasks;
+    private final Mutex<Map<long, TaskControl>> controls;
+    private final Mutex<TimerWheel> timerWheel;
+    private final Mutex<ArrayDeque<TimerRequest>> timerRequests;
+    private final Mutex<ReactorHolder> reactor;
+    private final Mutex<WriterHolder> wakeWriter;
+    private final BlockingPool blockingPool;
+    private final AtomicLong nextTaskId;
+    private final AtomicLong spawnedTasks;
+    private final AtomicLong completedTasks;
+    private final AtomicBool rootWoken;
+    private boolean shutdown;
+
+    /**
+     * Constructs a new runtime engine instance with the specified configuration.
+     *
+     * @param id Unique engine identifier.
+     * @param enableTimer Whether timers are enabled.
+     * @param enableIo Whether I/O reactor is enabled.
+     * @param reactorInstance Optional OS event reactor.
+     * @param writer Optional inter-thread wake writer stream.
+     */
+    Engine(
+        int id,
+        boolean enableTimer,
+        boolean enableIo,
+        Reactor? reactorInstance,
+        TcpStream? writer
+    ) {
+        this.id = id;
+        this.enableTimer = enableTimer;
+        this.enableIo = enableIo;
+        this.readyQueue = new Mutex<>(new ArrayDeque<>());
+        this.tasks = new Mutex<>(new HashMap<>());
+        this.controls = new Mutex<>(new HashMap<>());
+        this.timerWheel = new Mutex<>(new TimerWheel());
+        this.timerRequests = new Mutex<>(new ArrayDeque<>());
+        this.reactor = new Mutex<>(new ReactorHolder(reactorInstance));
+        this.wakeWriter = new Mutex<>(new WriterHolder(writer));
+        this.blockingPool = new BlockingPool();
+        this.nextTaskId = new AtomicLong(1L);
+        this.spawnedTasks = new AtomicLong(0L);
+        this.completedTasks = new AtomicLong(0L);
+        this.rootWoken = new AtomicBool(false);
+        this.shutdown = false;
+    }
+
+    /**
+     * Returns the engine unique identifier.
+     *
+     * @return Engine ID.
+     */
+    int id() {
+        return this.id;
+    }
+
+    /**
+     * Allocates the next unique task ID.
+     *
+     * @return Newly allocated task ID.
+     */
+    long nextTaskId() {
+        return this.nextTaskId.increment();
+    }
+
+    /**
+     * Checks if the engine has been shut down.
+     *
+     * @return {@code true} if shut down; {@code false} otherwise.
+     */
+    boolean isShutdown() {
+        return this.shutdown;
+    }
+
+    /**
+     * Creates a task control tracking entry for the specified task ID.
+     *
+     * @param taskId Task identifier.
+     */
+    void createTaskControl(long taskId) {
+        long id = taskId;
+        this.spawnedTasks.increment();
+        Mutex.Guard<Map<long, TaskControl>> guard = this.controls.lock();
+        guard.getMut().put(id, new TaskControl());
+    }
+
+    /**
+     * Completes a task with a successful value, returning the join waker if registered.
+     *
+     * @param taskId Task identifier.
+     * @param value Resolved value.
+     * @return Join waker to awaken, or null.
+     */
+    Waker? finishTask(long taskId, Object? value) {
+        long id = taskId;
+        this.completedTasks.increment();
+        Mutex.Guard<Map<long, TaskControl>> guard = this.controls.lock();
+        (&mut TaskControl)? control = guard.getMut().getMut(&id);
+        if (control != null) {
+            control.finish(value);
+            return control.takeJoinWaker();
+        }
+        return null;
+    }
+
+    /**
+     * Completes a task with a failure exception, returning the join waker if registered.
+     *
+     * @param taskId Task identifier.
+     * @param e Exception thrown by task.
+     * @return Join waker to awaken, or null.
+     */
+    Waker? failTask(long taskId, Exception e) {
+        long id = taskId;
+        this.completedTasks.increment();
+        Mutex.Guard<Map<long, TaskControl>> guard = this.controls.lock();
+        (&mut TaskControl)? control = guard.getMut().getMut(&id);
+        if (control != null) {
+            control.fail(e);
+            return control.takeJoinWaker();
+        }
+        return null;
+    }
+
+    /**
+     * Spawns an asynchronous task onto the cooperative scheduler.
+     *
+     * @param <T> Future return value type.
+     * @param handle Runtime handle.
+     * @param future Task future.
+     * @return JoinHandle for the task.
+     */
+    <T> JoinHandle<T> spawn(Handle handle, Future<T> future) keeps future {
+        long taskId = this.nextTaskId();
+        this.createTaskControl(taskId);
+        Schedulable task = new Task<T>(handle, taskId, future);
+        {
+            Mutex.Guard<Map<long, Schedulable>> guard = this.tasks.lock();
+            guard.getMut().put(taskId, task);
+        }
+        this.enqueueReady(taskId);
+        return new JoinHandle<>(taskId);
+    }
+
+    /**
+     * Spawns a blocking action onto the runtime's dedicated blocking pool.
+     *
+     * @param <T> Action return value type.
+     * @param handle Runtime handle.
+     * @param action Blocking action.
+     * @return JoinHandle for the task.
+     */
+    <T> JoinHandle<T> spawnBlocking(Handle handle, BlockingAction<T> action) {
+        long taskId = this.nextTaskId();
+        this.createTaskControl(taskId);
+        BlockingTask<T> runner = new BlockingTask<T>(handle, taskId, action);
+        this.blockingPool.submit(runner);
+        return new JoinHandle<>(taskId);
+    }
+
+    /**
+     * Takes the next blocking task from the blocking worker pool.
+     *
+     * @return TaskRunner if available, or null.
+     */
+    BlockingPool.TaskRunner? takeBlockingTask() {
+        return this.blockingPool.takeTask();
+    }
+
+    /**
+     * Enqueues a task ID onto the ready run queue and awakens waiting workers.
+     *
+     * @param taskId Task identifier.
+     */
+    void enqueueReady(long taskId) {
+        {
+            Mutex.Guard<ArrayDeque<long>> guard = this.readyQueue.lock();
+            guard.getMut().addLast(taskId);
+            this.readyQueue.notify();
+        }
+        this.wakeReactor();
+    }
+
+    /**
+     * Checks if the root task was awakened.
+     *
+     * @return {@code true} if root task was awakened.
+     */
+    boolean isRootWoken() {
+        return this.rootWoken.get();
+    }
+
+    /**
+     * Takes and resets the root task awakened flag.
+     *
+     * @return {@code true} if root task had been awakened.
+     */
+    boolean takeRootWoken() {
+        return this.rootWoken.compareAndSet(true, false);
+    }
+
+    /**
+     * Wakes a scheduled task by task ID.
+     *
+     * @param taskId Task identifier (-1 for root task).
+     */
+    void wakeTask(long taskId) {
+        if (taskId == -1L) {
+            this.rootWoken.set(true);
+            this.wakeReactor();
+            return;
+        }
+        this.enqueueReady(taskId);
+    }
+
+    /**
+     * Aborts an active task, canceling its future and notifying joiners.
+     *
+     * @param taskId Task identifier.
+     * @return Join waker to awaken, or null.
+     */
+    Waker? abortTask(long taskId) {
+        long id = taskId;
+        this.completedTasks.increment();
+        Waker? joinWaker = null;
+        {
+            Mutex.Guard<Map<long, TaskControl>> guard = this.controls.lock();
+            (&mut TaskControl)? control = guard.getMut().getMut(&id);
+            if (control != null) {
+                control.abort();
+                joinWaker = control.takeJoinWaker();
+            }
+        }
+        {
+            Mutex.Guard<Map<long, Schedulable>> guard = this.tasks.lock();
+            (&mut Schedulable)? task = guard.getMut().getMut(&id);
+            if (task != null) {
+                task.abort();
+                guard.getMut().remove(&id);
+            }
+        }
+        this.wakeTask(taskId);
+        return joinWaker;
+    }
+
+    /**
+     * Checks whether the task with the given ID has finished.
+     *
+     * @param taskId Task identifier.
+     * @return {@code true} if finished.
+     */
+    boolean isTaskFinished(long taskId) {
+        long id = taskId;
+        Mutex.Guard<Map<long, TaskControl>> guard = this.controls.lock();
+        (&TaskControl)? control = guard.get().get(&id);
+        return control != null && control.isFinished();
+    }
+
+    /**
+     * Polls the join handle for task completion.
+     *
+     * @param <T> Return type.
+     * @param taskId Task identifier.
+     * @param waker Joining caller waker.
+     * @return Ready with result; Pending otherwise.
+     * @throws Exception If task threw an exception or was cancelled.
+     */
+    <T> Poll<T> pollJoin(long taskId, &Waker waker) throws Exception {
+        long id = taskId;
+        Mutex.Guard<Map<long, TaskControl>> guard = this.controls.lock();
+        (&mut TaskControl)? control = guard.getMut().getMut(&id);
+        if (control == null) {
+            throw new IllegalStateException("task $taskId does not exist");
+        }
+        if (control.isAborted()) {
+            guard.getMut().remove(&id);
+            throw new CancellationException("task $taskId was cancelled");
+        }
+        Exception? error = control.takeError();
+        if (error != null) {
+            guard.getMut().remove(&id);
+            throw error;
+        }
+        if (control.isFinished()) {
+            TaskControl? taken = guard.getMut().remove(&id);
+            if (taken != null) {
+                Object? raw = taken.takeValue();
+                if (raw != null) {
+                    T value = (T) raw;
+                    return Poll.Ready(value);
+                }
+            }
+            throw new IllegalStateException("task finished without value");
+        }
+        control.joinWaker(waker.copy());
+        return Poll.Pending;
+    }
+
+    /**
+     * Schedules a timer deadline on this engine's timer wheel.
+     *
+     * @param deadline Expiration instant.
+     * @param waker Task waker to awaken on expiration.
+     * @return Unique timer identifier.
+     */
+    long scheduleTimer(Instant deadline, Waker waker) {
+        long timerId = this.nextTaskId();
+        Mutex.Guard<ArrayDeque<TimerRequest>> guard = this.timerRequests.lock();
+        guard.getMut().addLast(new TimerRequest(timerId, deadline, waker));
+        this.wakeReactor();
+        return timerId;
+    }
+
+    /**
+     * Drains pending timer scheduling requests into the timer wheel.
+     */
+    void drainTimers() {
+        if (!this.enableTimer) {
+            return;
+        }
+        List<TimerRequest> drained = new ArrayList<>();
+        {
+            Mutex.Guard<ArrayDeque<TimerRequest>> guard = this.timerRequests.lock();
+            while (!guard.get().isEmpty()) {
+                drained.add(guard.getMut().removeFirst());
+            }
+        }
+        if (!drained.isEmpty()) {
+            Mutex.Guard<TimerWheel> wheel = this.timerWheel.lock();
+            for (int i = 0; i < drained.size(); i++) {
+                &TimerRequest req = drained.get(i);
+                wheel.getMut().schedule(req.deadline(), req.waker().copy());
+            }
+        }
+    }
+
+    /**
+     * Polls the timer wheel for expired timers up to the specified instant.
+     *
+     * @param now Current instant.
+     * @return List of task wakers ready to be awakened.
+     */
+    List<Waker> pollTimers(Instant now) {
+        if (!this.enableTimer) {
+            return new ArrayList<>();
+        }
+        this.drainTimers();
+        Mutex.Guard<TimerWheel> wheel = this.timerWheel.lock();
+        return wheel.getMut().pollExpired(now);
+    }
+
+    /**
+     * Returns the earliest pending timer deadline.
+     *
+     * @return Earliest timer deadline, or null.
+     */
+    Instant? nextTimerDeadline() {
+        if (!this.enableTimer) {
+            return null;
+        }
+        this.drainTimers();
+        Mutex.Guard<TimerWheel> wheel = this.timerWheel.lock();
+        return wheel.get().nextDeadline();
+    }
+
+    /**
+     * Registers a TCP listener with the reactor.
+     *
+     * @param listener Network listener.
+     * @return Registration token.
+     * @throws IOException If registering fails.
+     */
+    int registerListener(&mut TcpListener listener) throws IOException {
+        Mutex.Guard<ReactorHolder> guard = this.reactor.lock();
+        if (!guard.get().isPresent()) {
+            throw new IllegalStateException("I/O reactor is disabled on this runtime");
+        }
+        int? token = guard.getMut().registerListener(listener);
+        return token ?: 0;
+    }
+
+    /**
+     * Registers a TCP stream with the reactor.
+     *
+     * @param stream Network TCP stream.
+     * @param interest Interest mask.
+     * @return Registration token.
+     * @throws IOException If registering fails.
+     */
+    int registerStream(&mut TcpStream stream, Poller.Interest interest) throws IOException {
+        Mutex.Guard<ReactorHolder> guard = this.reactor.lock();
+        if (!guard.get().isPresent()) {
+            throw new IllegalStateException("I/O reactor is disabled on this runtime");
+        }
+        int? token = guard.getMut().registerStream(stream, interest);
+        return token ?: 0;
+    }
+
+    /**
+     * Registers a UDP socket with the reactor.
+     *
+     * @param socket UDP datagram socket.
+     * @param interest Interest mask.
+     * @return Registration token.
+     * @throws IOException If registering fails.
+     */
+    int registerUdp(&mut UdpSocket socket, Poller.Interest interest) throws IOException {
+        Mutex.Guard<ReactorHolder> guard = this.reactor.lock();
+        if (!guard.get().isPresent()) {
+            throw new IllegalStateException("I/O reactor is disabled on this runtime");
+        }
+        int? token = guard.getMut().registerUdp(socket, interest);
+        return token ?: 0;
+    }
+
+    /**
+     * Deregisters a UDP socket from the reactor.
+     *
+     * @param socket UDP datagram socket.
+     * @param token Registration token.
+     * @throws IOException If deregistering fails.
+     */
+    void deregisterUdp(&mut UdpSocket socket, int token) throws IOException {
+        Mutex.Guard<ReactorHolder> guard = this.reactor.lock();
+        if (guard.get().isPresent()) {
+            guard.getMut().deregisterUdp(socket, token);
+        }
+    }
+
+    /**
+     * Updates interest on a registered stream.
+     *
+     * @param stream Network TCP stream.
+     * @param token Registration token.
+     * @param interest Updated interest mask.
+     * @throws IOException If updating fails.
+     */
+    void reregisterStream(&mut TcpStream stream, int token, Poller.Interest interest) throws IOException {
+        Mutex.Guard<ReactorHolder> guard = this.reactor.lock();
+        guard.getMut().reregisterStream(stream, token, interest);
+    }
+
+    /**
+     * Deregisters a stream from the reactor.
+     *
+     * @param stream Network TCP stream.
+     * @param token Registration token.
+     * @throws IOException If deregistration fails.
+     */
+    void deregisterStream(&mut TcpStream stream, int token) throws IOException {
+        Mutex.Guard<ReactorHolder> guard = this.reactor.lock();
+        guard.getMut().deregisterStream(stream, token);
+    }
+
+    /**
+     * Deregisters a listener from the reactor.
+     *
+     * @param listener Network listener.
+     * @param token Registration token.
+     * @throws IOException If deregistration fails.
+     */
+    void deregisterListener(&mut TcpListener listener, int token) throws IOException {
+        Mutex.Guard<ReactorHolder> guard = this.reactor.lock();
+        guard.getMut().deregisterListener(listener, token);
+    }
+
+    /**
+     * Registers a read waker for a reactor token.
+     *
+     * @param token Descriptor token.
+     * @param waker Task waker.
+     */
+    void readWaker(int token, Waker waker) {
+        Mutex.Guard<ReactorHolder> guard = this.reactor.lock();
+        guard.getMut().readWaker(token, waker);
+    }
+
+    /**
+     * Registers a write waker for a reactor token.
+     *
+     * @param token Descriptor token.
+     * @param waker Task waker.
+     */
+    void writeWaker(int token, Waker waker) {
+        Mutex.Guard<ReactorHolder> guard = this.reactor.lock();
+        guard.getMut().writeWaker(token, waker);
+    }
+
+    /**
+     * Checks if a descriptor is readable.
+     *
+     * @param token Descriptor token.
+     * @return {@code true} if readable.
+     */
+    boolean isReadable(int token) {
+        Mutex.Guard<ReactorHolder> guard = this.reactor.lock();
+        return guard.get().isReadable(token);
+    }
+
+    /**
+     * Checks if a descriptor is writable.
+     *
+     * @param token Descriptor token.
+     * @return {@code true} if writable.
+     */
+    boolean isWritable(int token) {
+        Mutex.Guard<ReactorHolder> guard = this.reactor.lock();
+        return guard.get().isWritable(token);
+    }
+
+    /**
+     * Clears readable readiness flag.
+     *
+     * @param token Descriptor token.
+     */
+    void clearReadable(int token) {
+        Mutex.Guard<ReactorHolder> guard = this.reactor.lock();
+        guard.getMut().clearReadable(token);
+    }
+
+    /**
+     * Clears writable readiness flag.
+     *
+     * @param token Descriptor token.
+     */
+    void clearWritable(int token) {
+        Mutex.Guard<ReactorHolder> guard = this.reactor.lock();
+        guard.getMut().clearWritable(token);
+    }
+
+    /**
+     * Polls the reactor for readiness events.
+     *
+     * @param timeoutMillis Poll timeout in milliseconds.
+     * @return List of ready task wakers.
+     * @throws IOException If polling fails.
+     */
+    List<Waker> pollReactor(long timeoutMillis) throws IOException {
+        if (!this.enableIo) {
+            return new ArrayList<>();
+        }
+        Mutex.Guard<ReactorHolder> guard = this.reactor.lock();
+        return guard.getMut().poll(timeoutMillis);
+    }
+
+    /**
+     * Takes the next ready task from the scheduler run queue.
+     *
+     * @param timeoutMillis Maximum wait time.
+     * @return Task ID, or 0 if timeout.
+     */
+    long takeReadyTask(long timeoutMillis) {
+        Mutex.Guard<ArrayDeque<long>> guard = this.readyQueue.lock();
+        if (guard.get().isEmpty()) {
+            if (timeoutMillis > 0L && !this.shutdown) {
+                guard.wait(timeoutMillis);
+            }
+        }
+        if (!guard.get().isEmpty()) {
+            return guard.getMut().removeFirst();
+        }
+        return 0L;
+    }
+
+    /**
+     * Checks if any tasks are queued in the ready queue.
+     *
+     * @return {@code true} if tasks are ready.
+     */
+    boolean hasReadyTasks() {
+        Mutex.Guard<ArrayDeque<long>> guard = this.readyQueue.lock();
+        return !guard.get().isEmpty();
+    }
+
+    /**
+     * Returns a snapshot of runtime metrics.
+     *
+     * @return RuntimeMetrics snapshot.
+     */
+    tide.metrics.RuntimeMetrics metrics() {
+        long spawned = this.spawnedTasks.get();
+        long completed = this.completedTasks.get();
+        long active = spawned > completed ? spawned - completed : 0L;
+        int readyDepth = 0;
+        {
+            Mutex.Guard<ArrayDeque<long>> guard = this.readyQueue.lock();
+            readyDepth = guard.get().size();
+        }
+        int blockingDepth = this.blockingPool.queueDepth();
+        return new tide.metrics.RuntimeMetrics(
+            spawned,
+            completed,
+            active,
+            readyDepth,
+            blockingDepth
+        );
+    }
+
+    /**
+     * Removes and returns a task from the active task map for execution.
+     *
+     * @param taskId Task identifier.
+     * @return Schedulable task, or null.
+     */
+    Schedulable? takeTask(long taskId) {
+        long id = taskId;
+        Mutex.Guard<Map<long, Schedulable>> guard = this.tasks.lock();
+        return guard.getMut().remove(&id);
+    }
+
+    /**
+     * Returns an uncompleted task back to the active task map after polling.
+     *
+     * @param taskId Task identifier.
+     * @param task Schedulable task instance.
+     */
+    void returnTask(long taskId, Schedulable task) {
+        long id = taskId;
+        Mutex.Guard<Map<long, Schedulable>> guard = this.tasks.lock();
+        guard.getMut().put(id, task);
+    }
+
+    /**
+     * Awakens the reactor thread by writing a single byte to the wake pipe.
+     */
+    void wakeReactor() {
+        this.wakeWriter.lock().getMut().write("w");
+    }
+
+    /**
+     * Initiates shutdown of the engine, releasing timers, reactor, and blocking workers.
+     */
+    mut void shutdown() {
+        if (this.shutdown) {
+            return;
+        }
+        this.shutdown = true;
+        this.wakeReactor();
+        {
+            Mutex.Guard<ArrayDeque<long>> guard = this.readyQueue.lock();
+            this.readyQueue.notifyAll();
+        }
+        this.blockingPool.shutdown();
+        {
+            Mutex.Guard<ReactorHolder> guard = this.reactor.lock();
+            guard.getMut().close();
+        }
+        this.wakeWriter.lock().getMut().close();
+        {
+            Mutex.Guard<Map<long, Schedulable>> guard = this.tasks.lock();
+            guard.getMut().clear();
+        }
+        {
+            Mutex.Guard<Map<long, TaskControl>> guard = this.controls.lock();
+            guard.getMut().clear();
+        }
+    }
+
+    /**
+     * Thread-safe wrapper holding an optional Reactor instance.
+     */
+    static final class ReactorHolder {
+        private Reactor? reactor;
+
+        /**
+         * Constructs a ReactorHolder wrapping an optional reactor.
+         *
+         * @param reactor Optional reactor instance.
+         */
+        ReactorHolder(Reactor? reactor) {
+            this.reactor = reactor;
+        }
+
+        /**
+         * Checks if a reactor instance is present.
+         *
+         * @return {@code true} if present.
+         */
+        boolean isPresent() {
+            return this.reactor != null;
+        }
+
+        /**
+         * Registers a TCP listener with the underlying reactor.
+         *
+         * @param listener Network listener.
+         * @return Registration token, or null.
+         * @throws IOException If registering fails.
+         */
+        mut int? registerListener(&mut TcpListener listener) throws IOException {
+            return this.reactor?.registerListener(listener);
+        }
+
+        /**
+         * Registers a TCP stream with the underlying reactor.
+         *
+         * @param stream Network TCP stream.
+         * @param interest Interest mask.
+         * @return Registration token, or null.
+         * @throws IOException If registering fails.
+         */
+        mut int? registerStream(&mut TcpStream stream, Poller.Interest interest) throws IOException {
+            return this.reactor?.registerStream(stream, interest);
+        }
+
+        /**
+         * Reregisters a stream with updated interest.
+         *
+         * @param stream Network TCP stream.
+         * @param token Registration token.
+         * @param interest Updated interest mask.
+         * @throws IOException If reregistering fails.
+         */
+        mut void reregisterStream(&mut TcpStream stream, int token, Poller.Interest interest) throws IOException {
+            this.reactor?.reregisterStream(stream, token, interest);
+        }
+
+        /**
+         * Deregisters a stream from the underlying reactor.
+         *
+         * @param stream Network TCP stream.
+         * @param token Registration token.
+         * @throws IOException If deregistration fails.
+         */
+        mut void deregisterStream(&mut TcpStream stream, int token) throws IOException {
+            this.reactor?.deregisterStream(stream, token);
+        }
+
+        /**
+         * Deregisters a listener from the underlying reactor.
+         *
+         * @param listener Network listener.
+         * @param token Registration token.
+         * @throws IOException If deregistration fails.
+         */
+        mut void deregisterListener(&mut TcpListener listener, int token) throws IOException {
+            this.reactor?.deregisterListener(listener, token);
+        }
+
+        /**
+         * Registers a UDP socket with the underlying reactor.
+         *
+         * @param socket UDP socket.
+         * @param interest Interest mask.
+         * @return Registration token, or null.
+         * @throws IOException If registering fails.
+         */
+        mut int? registerUdp(&mut UdpSocket socket, Poller.Interest interest) throws IOException {
+            return this.reactor?.registerUdp(socket, interest);
+        }
+
+        /**
+         * Deregisters a UDP socket from the underlying reactor.
+         *
+         * @param socket UDP socket.
+         * @param token Registration token.
+         * @throws IOException If deregistering fails.
+         */
+        mut void deregisterUdp(&mut UdpSocket socket, int token) throws IOException {
+            this.reactor?.deregisterUdp(socket, token);
+        }
+
+        /**
+         * Registers a read waker on the underlying reactor.
+         *
+         * @param token Registration token.
+         * @param waker Task waker.
+         */
+        mut void readWaker(int token, Waker waker) {
+            this.reactor?.readWaker(token, waker);
+        }
+
+        /**
+         * Registers a write waker on the underlying reactor.
+         *
+         * @param token Registration token.
+         * @param waker Task waker.
+         */
+        mut void writeWaker(int token, Waker waker) {
+            this.reactor?.writeWaker(token, waker);
+        }
+
+        /**
+         * Checks if the descriptor is readable.
+         *
+         * @param token Registration token.
+         * @return {@code true} if readable.
+         */
+        boolean isReadable(int token) {
+            return this.reactor?.isReadable(token) ?: false;
+        }
+
+        /**
+         * Checks if the descriptor is writable.
+         *
+         * @param token Registration token.
+         * @return {@code true} if writable.
+         */
+        boolean isWritable(int token) {
+            return this.reactor?.isWritable(token) ?: false;
+        }
+
+        /**
+         * Clears readable flag on the descriptor.
+         *
+         * @param token Registration token.
+         */
+        mut void clearReadable(int token) {
+            this.reactor?.clearReadable(token);
+        }
+
+        /**
+         * Clears writable flag on the descriptor.
+         *
+         * @param token Registration token.
+         */
+        mut void clearWritable(int token) {
+            this.reactor?.clearWritable(token);
+        }
+
+        /**
+         * Polls the underlying reactor for ready events.
+         *
+         * @param timeoutMillis Poll timeout in milliseconds.
+         * @return List of ready task wakers.
+         * @throws IOException If polling fails.
+         */
+        mut List<Waker> poll(long timeoutMillis) throws IOException {
+            return this.reactor?.poll(timeoutMillis) ?: new ArrayList<Waker>();
+        }
+
+        /**
+         * Closes and clears the wrapped reactor.
+         */
+        mut void close() {
+            this.reactor?.close();
+            Objects.take(&mut this.reactor);
+        }
+    }
+
+    /**
+     * Thread-safe wrapper holding the inter-thread wake writer stream.
+     */
+    static final class WriterHolder {
+        private TcpStream? writer;
+
+        /**
+         * Constructs a WriterHolder wrapping an optional wake stream.
+         *
+         * @param writer Optional stream.
+         */
+        WriterHolder(TcpStream? writer) {
+            this.writer = writer;
+        }
+
+        /**
+         * Writes a wake message across the stream.
+         *
+         * @param msg Message string.
+         */
+        mut void write(String msg) {
+            try {
+                this.writer?.write(msg);
+            } catch (IOException e) {}
+        }
+
+        /**
+         * Closes and clears the wake writer stream.
+         */
+        mut void close() {
+            Objects.take(&mut this.writer);
+        }
+    }
+
+    /**
+     * Interface representing a schedulable unit of asynchronous work.
+     */
+    interface Schedulable {
+        /**
+         * Returns the unique task ID.
+         *
+         * @return Task identifier.
+         */
+        long taskId();
+
+        /**
+         * Polls the underlying future one cooperative step.
+         */
+        mut void pollTask();
+
+        /**
+         * Checks if the task has finished executing.
+         *
+         * @return {@code true} if completed.
+         */
+        boolean isFinished();
+
+        /**
+         * Checks if the task was aborted before completion.
+         *
+         * @return {@code true} if aborted.
+         */
+        boolean isAborted();
+
+        /**
+         * Aborts the task execution.
+         */
+        mut void abort();
+
+        /**
+         * Takes the resolved value upon successful completion.
+         *
+         * @return Resolved value, or null.
+         */
+        mut Object? takeValue();
+
+        /**
+         * Takes the exception if the task failed.
+         *
+         * @return Exception, or null.
+         */
+        mut Exception? takeError();
+    }
+
+    /**
+     * Type-erased wrapper executing an asynchronous {@link Future} to completion.
+     *
+     * @param <T> Future return value type.
+     */
+    static final class Task<T> implements Schedulable {
+        private final Handle handle;
+        private final long taskId;
+        private Future<T>? future;
+        private boolean finished;
+        private boolean aborted;
+        private Object? value;
+        private Exception? error;
+
+        /**
+         * Constructs a Task wrapper for the given future.
+         *
+         * @param handle Host runtime handle.
+         * @param taskId Task identifier.
+         * @param future Task future.
+         */
+        Task(Handle handle, long taskId, Future<T> future) {
+            this.handle = handle;
+            this.taskId = taskId;
+            this.future = future;
+            this.finished = false;
+            this.aborted = false;
+            this.value = null;
+            this.error = null;
+        }
+
+        /**
+         * Returns the task identifier.
+         *
+         * @return Task ID.
+         */
+        @Override
+        long taskId() {
+            return this.taskId;
+        }
+
+        /**
+         * Checks whether the task has completed.
+         *
+         * @return {@code true} if finished.
+         */
+        @Override
+        boolean isFinished() {
+            return this.finished;
+        }
+
+        /**
+         * Checks whether the task was aborted.
+         *
+         * @return {@code true} if aborted.
+         */
+        @Override
+        boolean isAborted() {
+            return this.aborted;
+        }
+
+        /**
+         * Takes the completed return value.
+         *
+         * @return Resolved value, or null.
+         */
+        @Override
+        mut Object? takeValue() {
+            return Objects.take(&mut this.value);
+        }
+
+        /**
+         * Takes the failure exception.
+         *
+         * @return Exception, or null.
+         */
+        @Override
+        mut Exception? takeError() {
+            return Objects.take(&mut this.error);
+        }
+
+        /**
+         * Aborts the task future.
+         */
+        @Override
+        mut void abort() {
+            this.aborted = true;
+            this.finished = true;
+            Objects.take(&mut this.future);
+        }
+
+        /**
+         * Polls the future cooperatively.
+         */
+        @Override
+        mut void pollTask() {
+            if (this.finished || this.aborted) {
+                return;
+            }
+            long id = this.taskId;
+            Context cx = new Context(new TaskWaker(this.handle, id));
+            try {
+                Poll<T>? poll = this.future?.poll(&mut cx);
+                if (poll == null) {
+                    return;
+                }
+                switch (poll) {
+                    case Ready(T value) -> {
+                        this.finished = true;
+                        Objects.take(&mut this.future);
+                        this.value = value;
+                    }
+                    case Pending -> {}
+                }
+            } catch (Exception e) {
+                this.finished = true;
+                Objects.take(&mut this.future);
+                this.error = e;
+            }
+        }
+    }
+
+    /**
+     * Wrapper executing a synchronous {@link BlockingAction} on the blocking pool.
+     *
+     * @param <T> Blocking action return value type.
+     */
+    static final class BlockingTask<T> implements BlockingPool.TaskRunner {
+        private final Handle handle;
+        private final long taskId;
+        private BlockingAction<T> action;
+
+        /**
+         * Constructs a BlockingTask wrapper.
+         *
+         * @param handle Host runtime handle.
+         * @param taskId Task identifier.
+         * @param action Blocking action to run.
+         */
+        BlockingTask(Handle handle, long taskId, BlockingAction<T> action) {
+            this.handle = handle;
+            this.taskId = taskId;
+            this.action = action;
+        }
+
+        /**
+         * Runs the blocking action and reports completion or failure to the runtime.
+         */
+        @Override
+        mut void run() {
+            try {
+                T value = this.action.run();
+                Runtime.finishTask(this.handle.id(), this.taskId, value);
+            } catch (Exception e) {
+                Runtime.failTask(this.handle.id(), this.taskId, e);
+            }
+        }
+    }
+
+    /**
+     * Task-specific waker that signals the runtime engine to re-enqueue the task
+     * onto the ready queue when polled resources become available.
+     *
+     * @param handle Host runtime handle.
+     * @param taskId Unique identifier of the task.
+     */
+    record TaskWaker(Handle handle, long taskId) implements Waker {
+        /**
+         * Re-enqueues the associated task onto the scheduler ready queue.
+         */
+        @Override
+        void wake() {
+            this.handle.wakeTask(this.taskId);
+        }
+
+        /**
+         * Creates an independent copy of this waker.
+         *
+         * @return Cloned TaskWaker.
+         */
+        @Override
+        Waker copy() {
+            return new TaskWaker(this.handle, this.taskId);
+        }
+    }
+
+    /**
+     * Pending timer request waiting for deadline expiration.
+     *
+     * @param id Unique timer ID.
+     * @param deadline Expiration instant.
+     * @param waker Waker to notify on expiration.
+     */
+    record TimerRequest(long id, Instant deadline, Waker waker) {}
+}

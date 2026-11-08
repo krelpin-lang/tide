@@ -1,0 +1,214 @@
+package tide.time;
+
+import std.task.Waker;
+import std.time.Instant;
+import std.util.ArrayList;
+import std.util.HashMap;
+import std.util.List;
+import std.util.Map;
+
+/**
+ * Hierarchical timer collection used by the runtime engine to schedule, cancel,
+ * and fire deadline-based timer events.
+ */
+final class TimerWheel {
+    private long nextId;
+    private final Map<long, Entry> entries;
+
+    /**
+     * Initializes an empty TimerWheel.
+     */
+    TimerWheel() {
+        this.nextId = 1L;
+        this.entries = new HashMap<>();
+    }
+
+    /**
+     * Schedules a timer event to trigger at the specified deadline.
+     *
+     * @param deadline The instant when the timer expires.
+     * @param waker The task waker to notify.
+     * @return Unique identifier for the scheduled timer.
+     */
+    mut long schedule(Instant deadline, Waker waker) {
+        long id = this.nextId++;
+        this.entries.put(id, new Entry(id, deadline, waker));
+        return id;
+    }
+
+    /**
+     * Cancels a previously scheduled timer event.
+     *
+     * @param id The timer identifier to cancel.
+     */
+    mut void cancel(long id) {
+        (&mut Entry)? entry = this.entries.getMut(&id);
+        if (entry != null) {
+            entry.setCancelled(true);
+        }
+    }
+
+    /**
+     * Returns the earliest active deadline among all scheduled timer events.
+     *
+     * @return The earliest Instant, or {@code null} if no timers are pending.
+     */
+    Instant? nextDeadline() {
+        Instant? earliest = null;
+        List<long> keys = new ArrayList<>();
+        for (long key : this.entries.keySet()) {
+            keys.add(key);
+        }
+        for (&long idRef : &keys) {
+            long id = idRef;
+            (&Entry)? entry = this.entries.get(&id);
+            if (entry == null || entry.cancelled() || entry.expired()) {
+                continue;
+            }
+            Instant deadline = entry.deadline();
+            if (earliest == null || deadline.isBefore(earliest)) {
+                earliest = deadline;
+            }
+        }
+        return earliest;
+    }
+
+    /**
+     * Polls and collects all wakers whose deadlines have expired by the given timestamp.
+     *
+     * @param now Current timestamp.
+     * @return List of wakers ready to be awakened.
+     */
+    mut List<Waker> pollExpired(Instant now) {
+        List<Waker> ready = new ArrayList<>();
+        List<long> keys = new ArrayList<>();
+        for (long key : this.entries.keySet()) {
+            keys.add(key);
+        }
+        List<long> toRemove = new ArrayList<>();
+        for (&long idRef : &keys) {
+            long id = idRef;
+            (&mut Entry)? entry = this.entries.getMut(&id);
+            if (entry == null) {
+                continue;
+            }
+            if (entry.cancelled()) {
+                toRemove.add(id);
+                continue;
+            }
+            if (!entry.deadline().isAfter(now)) {
+                entry.setExpired(true);
+                Waker? w = entry.takeWaker();
+                if (w != null) {
+                    ready.add(w);
+                }
+                toRemove.add(id);
+            }
+        }
+        for (&long idRef : &toRemove) {
+            long id = idRef;
+            this.entries.remove(&id);
+        }
+        return ready;
+    }
+
+    /**
+     * Internal entry representing a scheduled timer deadline and waker.
+     */
+    static final class Entry {
+        private final long id;
+        private final Instant deadline;
+        private Waker? waker;
+        private boolean cancelled;
+        private boolean expired;
+
+        /**
+         * Constructs a TimerWheel entry.
+         *
+         * @param id Timer identifier.
+         * @param deadline Expiration instant.
+         * @param waker Task waker.
+         */
+        Entry(long id, Instant deadline, Waker waker) {
+            this.id = id;
+            this.deadline = deadline;
+            this.waker = waker;
+            this.cancelled = false;
+            this.expired = false;
+        }
+
+        /**
+         * Returns the timer identifier.
+         *
+         * @return Timer ID.
+         */
+        long id() {
+            return this.id;
+        }
+
+        /**
+         * Returns the expiration deadline.
+         *
+         * @return Deadline instant.
+         */
+        Instant deadline() {
+            return this.deadline;
+        }
+
+        /**
+         * Checks whether the timer was cancelled.
+         *
+         * @return {@code true} if cancelled.
+         */
+        boolean cancelled() {
+            return this.cancelled;
+        }
+
+        /**
+         * Checks whether the timer has expired.
+         *
+         * @return {@code true} if expired.
+         */
+        boolean expired() {
+            return this.expired;
+        }
+
+        /**
+         * Marks the timer as cancelled and clears its waker.
+         *
+         * @param value Cancelled flag value.
+         */
+        mut void setCancelled(boolean value) {
+            this.cancelled = value;
+            Objects.take(&mut this.waker);
+        }
+
+        /**
+         * Marks the timer as expired.
+         *
+         * @param value Expired flag value.
+         */
+        mut void setExpired(boolean value) {
+            this.expired = value;
+        }
+
+        /**
+         * Takes and clears the registered waker.
+         *
+         * @return Task waker, or null.
+         */
+        mut Waker? takeWaker() {
+            return Objects.take(&mut this.waker);
+        }
+
+        /**
+         * Awakens the registered task waker if still present.
+         */
+        mut void wake() {
+            Waker? w = Objects.take(&mut this.waker);
+            if (w != null) {
+                w.wake();
+            }
+        }
+    }
+}

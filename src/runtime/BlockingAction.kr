@@ -1,0 +1,17 @@
+package tide.runtime;
+
+/**
+ * Functional interface for a unit of work that performs blocking operations,
+ * executed on a dedicated blocking thread pool.
+ *
+ * @param <T> The return type of the blocking computation.
+ */
+interface BlockingAction<T> {
+    /**
+     * Executes the blocking action.
+     *
+     * @return The result of the computation.
+     * @throws Exception If an error occurs during execution.
+     */
+    T run() throws Exception;
+}

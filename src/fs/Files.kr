@@ -1,0 +1,171 @@
+package tide.fs;
+
+import std.io.IOException;
+import tide.Tide;
+
+/**
+ * Asynchronous file system helper methods (reading and writing text, bytes,
+ * checking existence, deleting, creating directories, and listing files)
+ * offloaded to the runtime blocking worker pool.
+ */
+final class Files {
+    /**
+     * Prevents direct instantiation of this static utility class.
+     */
+    private Files() {}
+
+    /**
+     * Asynchronously reads the entire content of a file into a UTF-8 string.
+     *
+     * @param path File path.
+     * @return Decoded file contents.
+     * @throws IOException If reading fails.
+     */
+    static async String readString(String path) throws IOException {
+        String p = path;
+        try {
+            return await Tide.spawnBlocking(() -> std.io.Files.readString(p));
+        } catch (IOException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IOException(e.getMessage() ?: "failed to read file");
+        }
+    }
+
+    /**
+     * Asynchronously writes a text string to a file, creating it if it does not exist.
+     *
+     * @param path File path.
+     * @param text Text content to write.
+     * @throws IOException If writing fails.
+     */
+    static async void writeString(String path, String text) throws IOException {
+        String p = path;
+        String t = text;
+        try {
+            await Tide.spawnBlocking(() -> {
+                std.io.Files.writeString(p, t);
+                return 0;
+            });
+        } catch (IOException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IOException(e.getMessage() ?: "failed to write file");
+        }
+    }
+
+    /**
+     * Asynchronously reads all bytes from a file.
+     *
+     * @param path File path.
+     * @return Array of all file bytes.
+     * @throws IOException If reading fails.
+     */
+    static async byte[] readBytes(String path) throws IOException {
+        String p = path;
+        try {
+            return await Tide.spawnBlocking(() -> std.io.Files.readBytes(p));
+        } catch (IOException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IOException(e.getMessage() ?: "failed to read file");
+        }
+    }
+
+    /**
+     * Asynchronously writes a byte array to a file, replacing its contents.
+     *
+     * @param path File path.
+     * @param bytes Byte data to write.
+     * @throws IOException If writing fails.
+     */
+    static async void writeBytes(String path, byte[] bytes) throws IOException {
+        String p = path;
+        byte[] b = bytes;
+        try {
+            await Tide.spawnBlocking(move () -> {
+                std.io.Files.writeBytes(p, &b);
+                return 0;
+            });
+        } catch (IOException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IOException(e.getMessage() ?: "failed to write file");
+        }
+    }
+
+    /**
+     * Asynchronously checks whether a file exists at the given path.
+     *
+     * @param path File path to query.
+     * @return {@code true} if exists; {@code false} otherwise.
+     */
+    static async boolean exists(String path) throws IOException {
+        String p = path;
+        try {
+            return await Tide.spawnBlocking(() -> std.io.Files.exists(p));
+        } catch (IOException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IOException(e.getMessage() ?: "failed to query file existence");
+        }
+    }
+
+    /**
+     * Asynchronously removes/deletes a file or directory from disk.
+     *
+     * @param path File path to remove.
+     * @throws IOException If deletion fails.
+     */
+    static async void remove(String path) throws IOException {
+        String p = path;
+        try {
+            await Tide.spawnBlocking(() -> {
+                std.io.Files.delete(p);
+                return 0;
+            });
+        } catch (IOException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IOException(e.getMessage() ?: "failed to remove file");
+        }
+    }
+
+    /**
+     * Asynchronously creates all directories along the specified path.
+     *
+     * @param path Directory path hierarchy to create.
+     * @throws IOException If directory creation fails.
+     */
+    static async void createDirectories(String path) throws IOException {
+        String p = path;
+        try {
+            await Tide.spawnBlocking(() -> {
+                std.io.Files.createDirectories(p);
+                return 0;
+            });
+        } catch (IOException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IOException(e.getMessage() ?: "failed to create directories");
+        }
+    }
+
+    /**
+     * Asynchronously lists entries in the given directory.
+     *
+     * @param directory Directory path.
+     * @return Array of file name strings within the directory.
+     * @throws IOException If listing fails.
+     */
+    static async String[] list(String directory) throws IOException {
+        String d = directory;
+        try {
+            return await Tide.spawnBlocking(() -> std.io.Files.list(d));
+        } catch (IOException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IOException(e.getMessage() ?: "failed to list directory");
+        }
+    }
+}

@@ -1,0 +1,89 @@
+package tide.signal;
+
+import std.sync.AtomicBool;
+import std.sync.Mutex;
+import std.task.Context;
+import std.task.Future;
+import std.task.Poll;
+import std.task.Unit;
+import std.task.Waker;
+import std.util.ArrayList;
+import std.util.List;
+
+/**
+ * Operating system signal listener and trigger coordinator (e.g. SIGINT / Ctrl-C).
+ */
+final class Signal {
+    private static final Mutex<List<Waker>> WAITERS = new Mutex<>(new ArrayList<>());
+    private static final AtomicBool TRIGGERED = new AtomicBool(false);
+
+    /**
+     * Prevents direct instantiation of this static utility class.
+     */
+    private Signal() {}
+
+    /**
+     * Creates an asynchronous future that resolves when a Ctrl-C / SIGINT signal is received.
+     *
+     * @return Future resolving with {@link Unit} on signal trigger.
+     */
+    static CtrlC ctrlC() {
+        return new CtrlC();
+    }
+
+    /**
+     * Programmatically triggers the signal, awakening all registered waiting tasks.
+     */
+    static void trigger() {
+        Signal.TRIGGERED.set(true);
+        List<Waker> ready = new ArrayList<>();
+        {
+            Mutex.Guard<List<Waker>> guard = Signal.WAITERS.lock();
+            while (!guard.get().isEmpty()) {
+                ready.add(guard.getMut().remove(0));
+            }
+        }
+        for (int i = 0; i < ready.size(); i++) {
+            &Waker w = ready.get(i);
+            w.wake();
+        }
+    }
+
+    /**
+     * Resets the signal state to un-triggered and clears all waiters.
+     */
+    static void reset() {
+        Signal.TRIGGERED.set(false);
+        Mutex.Guard<List<Waker>> guard = Signal.WAITERS.lock();
+        guard.getMut().clear();
+    }
+
+    /**
+     * Asynchronous future waiting for process interrupt notification (SIGINT / Ctrl-C).
+     */
+    static final class CtrlC implements Future<Unit> {
+        /**
+         * Constructs a new CtrlC signal future.
+         */
+        CtrlC() {}
+
+        /**
+         * Polls whether the interrupt signal has been triggered.
+         *
+         * @param cx Polling context with task waker.
+         * @return {@link Poll.Ready} if signaled; {@link Poll.Pending} otherwise.
+         */
+        @Override
+        mut Poll<Unit> poll(&mut Context cx) {
+            if (Signal.TRIGGERED.get()) {
+                return Poll.Ready(new Unit());
+            }
+            Mutex.Guard<List<Waker>> guard = Signal.WAITERS.lock();
+            if (Signal.TRIGGERED.get()) {
+                return Poll.Ready(new Unit());
+            }
+            guard.getMut().add(cx.waker().copy());
+            return Poll.Pending;
+        }
+    }
+}

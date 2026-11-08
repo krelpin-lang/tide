@@ -1,0 +1,11 @@
+package tide.future;
+
+/**
+ * Heterogeneous 2-element tuple combining results from asynchronous operations.
+ *
+ * @param <A> First element type.
+ * @param <B> Second element type.
+ * @param first First element.
+ * @param second Second element.
+ */
+record Pair<A, B>(A first, B second) {}

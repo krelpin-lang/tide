@@ -1,0 +1,20 @@
+package tide.time;
+
+/**
+ * Defines how an {@link Interval} reacts when one or more timer ticks are delayed
+ * or missed due to slow execution or scheduler load.
+ */
+enum MissedTickBehavior {
+    /**
+     * Ticks fire as rapidly as possible to catch up on missed ticks (default).
+     */
+    BURST,
+    /**
+     * Resets the next tick relative to current time, delaying subsequent ticks.
+     */
+    DELAY,
+    /**
+     * Skips missed ticks entirely, aligning next tick with the nearest future period boundary.
+     */
+    SKIP
+}

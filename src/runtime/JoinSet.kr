@@ -1,0 +1,113 @@
+package tide.runtime;
+
+import std.task.Future;
+import std.util.ArrayList;
+import std.util.List;
+
+/**
+ * A collection of spawned asynchronous tasks that allows callers to wait for completion
+ * in the order they finish (first-completed-first-served) and bulk abort or detach remaining tasks.
+ *
+ * @param <T> The return type of tasks managed within this set.
+ */
+final class JoinSet<T> {
+    private final Handle handle;
+    private final List<JoinHandle<T>> handles;
+
+    /**
+     * Creates an empty JoinSet bound to the ambient runtime.
+     */
+    JoinSet() {
+        this(Handle.current());
+    }
+
+    /**
+     * Creates an empty JoinSet bound to the specified runtime handle.
+     *
+     * @param handle The target runtime handle.
+     */
+    JoinSet(Handle handle) {
+        this.handle = handle;
+        this.handles = new ArrayList<>();
+    }
+
+    /**
+     * Adds an existing JoinHandle to this set.
+     *
+     * @param handle The handle to add.
+     */
+    mut void add(JoinHandle<T> handle) {
+        this.handles.add(handle);
+    }
+
+    /**
+     * Spawns a task onto the runtime and adds its handle to this JoinSet.
+     *
+     * @param set Target JoinSet.
+     * @param future The task future to spawn.
+     */
+    static <T> void spawnOn(&mut JoinSet<T> set, Future<T> future) keeps future {
+        JoinHandle<T> h = Handle.spawn(future);
+        set.add(h);
+    }
+
+    /**
+     * Awaits and removes the next completed task from the set.
+     *
+     * @return The result of the first task to finish, or {@code null} if the set is empty.
+     * @throws Exception If the completed task threw an exception or was cancelled.
+     */
+    mut async T? joinNext() throws Exception {
+        if (this.handles.isEmpty()) {
+            return null;
+        }
+        while (true) {
+            for (int i = 0; i < this.handles.size(); i++) {
+                &JoinHandle<T> h = this.handles.get(i);
+                if (h.isFinished()) {
+                    JoinHandle<T> ready = this.handles.remove(i);
+                    T value = await ready;
+                    return value;
+                }
+            }
+            await Runtime.yieldNow();
+        }
+    }
+
+    /**
+     * Aborts all remaining tasks currently tracked in this JoinSet and clears the collection.
+     */
+    mut void abortAll() {
+        for (int i = 0; i < this.handles.size(); i++) {
+            &JoinHandle<T> h = this.handles.get(i);
+            h.abort();
+        }
+        this.handles.clear();
+    }
+
+    /**
+     * Detaches all tasks, allowing them to continue running independently in the background,
+     * and clears the collection.
+     */
+    mut void detachAll() {
+        this.handles.clear();
+    }
+
+    /**
+     * Checks whether there are no remaining tasks tracked in this set.
+     *
+     * @return {@code true} if empty; {@code false} otherwise.
+     */
+    boolean isEmpty() {
+        return this.handles.isEmpty();
+    }
+
+    /**
+     * Returns the count of active tasks currently tracked in this set.
+     *
+     * @return Number of managed tasks.
+     */
+    int size() {
+        return this.handles.size();
+    }
+}

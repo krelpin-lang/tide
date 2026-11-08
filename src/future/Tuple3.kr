@@ -1,0 +1,13 @@
+package tide.future;
+
+/**
+ * Heterogeneous 3-element tuple combining results from asynchronous operations.
+ *
+ * @param <A> First element type.
+ * @param <B> Second element type.
+ * @param <C> Third element type.
+ * @param first First element.
+ * @param second Second element.
+ * @param third Third element.
+ */
+record Tuple3<A, B, C>(A first, B second, C third) {}

@@ -1,0 +1,179 @@
+package tide.channel.broadcast;
+
+import std.lang.Cloneable;
+import std.lang.Objects;
+import std.task.Poll;
+import std.task.Waker;
+import std.util.ArrayDeque;
+import std.util.ArrayList;
+import std.util.List;
+import std.util.Queue;
+
+/**
+ * Multi-producer, multi-consumer broadcast channel that clones transmitted messages
+ * to every registered active subscriber.
+ *
+ * @param <T> Transferred message type, must implement {@link Cloneable}.
+ */
+final class Broadcast<T extends Cloneable<T>> {
+    private final int capacity;
+    private final std.sync.Mutex<State<T>> inner;
+
+    /**
+     * Per-subscriber queue and waiter tracking state.
+     *
+     * @param <T> Transferred message type.
+     */
+    static final class SubState<T> {
+        final int id;
+        final Queue<T> queue;
+        Waker? waiter;
+        boolean closed;
+
+        /**
+         * Constructs a subscriber state with the given unique id.
+         *
+         * @param id Subscriber identifier.
+         */
+        SubState(int id) {
+            this.id = id;
+            this.queue = new ArrayDeque<>();
+            this.waiter = null;
+            this.closed = false;
+        }
+    }
+
+    /**
+     * Shared state tracking all active subscribers and token allocation.
+     *
+     * @param <T> Transferred message type.
+     */
+    private static final class State<T> {
+        int nextId;
+        List<SubState<T>> subs;
+
+        /**
+         * Constructs an empty initial broadcast channel state.
+         */
+        State() {
+            this.nextId = 1;
+            this.subs = new ArrayList<>();
+        }
+    }
+
+    /**
+     * Constructs a Broadcast channel with the specified per-subscriber buffer capacity.
+     *
+     * @param capacity Buffer capacity per subscriber.
+     */
+    Broadcast(int capacity) {
+        this.capacity = capacity;
+        this.inner = new std.sync.Mutex<>(new State<>());
+    }
+
+    /**
+     * Factory method creating a new broadcast channel.
+     *
+     * @param <T> Message type.
+     * @param capacity Buffer capacity per subscriber.
+     * @return New Broadcast instance.
+     */
+    static <T extends Cloneable<T>> Broadcast<T> channel(int capacity) {
+        return new Broadcast<>(capacity);
+    }
+
+    /**
+     * Borrows a {@link Sender} handle for broadcasting messages.
+     *
+     * @return Sender instance.
+     */
+    Sender<T> sender() borrows this {
+        return new Sender<>(this);
+    }
+
+    /**
+     * Subscribes a new receiver to this broadcast channel.
+     *
+     * @return Receiver instance.
+     */
+    Receiver<T> subscribe() borrows this {
+        int id = 0;
+        {
+            std.sync.Mutex.Guard<State<T>> guard = this.inner.lock();
+            &mut State<T> s = guard.getMut();
+            id = s.nextId;
+            s.nextId++;
+            s.subs.add(new SubState<>(id));
+        }
+        return new Receiver<>(this, id);
+    }
+
+    /**
+     * Broadcasts a message to all active subscribers.
+     *
+     * @param val Message to broadcast.
+     * @return Total count of active subscribers that received the message.
+     */
+    int send(T val) {
+        List<Waker> toWake = new ArrayList<>();
+        int count = 0;
+        {
+            std.sync.Mutex.Guard<State<T>> guard = this.inner.lock();
+            &mut State<T> s = guard.getMut();
+            count = s.subs.size();
+            for (int i = 0; i < s.subs.size(); i++) {
+                &mut SubState<T> sub = s.subs.getMut(i);
+                if (sub.queue.size() < this.capacity) {
+                    sub.queue.add(val.clone());
+                    Waker? w = Objects.take(&mut sub.waiter);
+                    if (w != null) {
+                        toWake.add(w);
+                    }
+                }
+            }
+        }
+        for (int i = 0; i < toWake.size(); i++) {
+            toWake.get(i).wake();
+        }
+        return count;
+    }
+
+    /**
+     * Polls the next broadcast message queued for the given subscriber.
+     *
+     * @param subId Subscriber token identifier.
+     * @param waker Task waker to awaken when a message arrives.
+     * @return Ready with message, or Pending.
+     */
+    Poll<T> pollReceive(int subId, &Waker waker) borrows this {
+        std.sync.Mutex.Guard<State<T>> guard = this.inner.lock();
+        &mut State<T> s = guard.getMut();
+        for (int i = 0; i < s.subs.size(); i++) {
+            &mut SubState<T> sub = s.subs.getMut(i);
+            if (sub.id == subId) {
+                if (sub.queue.size() > 0) {
+                    return Poll.Ready(sub.queue.remove());
+                }
+                sub.waiter = waker.copy();
+                return Poll.Pending;
+            }
+        }
+        return Poll.Pending;
+    }
+
+    /**
+     * Removes the subscriber and discards its buffered queue.
+     *
+     * @param subId Subscriber token identifier.
+     */
+    void unsubscribe(int subId) {
+        std.sync.Mutex.Guard<State<T>> guard = this.inner.lock();
+        &mut State<T> s = guard.getMut();
+        for (int i = 0; i < s.subs.size(); i++) {
+            if (s.subs.get(i).id == subId) {
+                s.subs.remove(i);
+                break;
+            }
+        }
+    }
+}

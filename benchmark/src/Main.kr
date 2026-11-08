@@ -1,0 +1,131 @@
+package benchmark;
+
+import std.lang.Console;
+import std.lang.System;
+import std.task.Unit;
+import std.util.ArrayList;
+import std.util.List;
+import tide.Tide;
+import tide.channel.mpsc.Mpsc;
+import tide.channel.mpsc.Receiver;
+import tide.channel.mpsc.Sender;
+import tide.runtime.JoinHandle;
+import tide.runtime.Runtime;
+
+/**
+ * High-concurrency performance benchmark for the Tide async runtime.
+ */
+final class Main {
+    private static final Mpsc<int> BENCH_CH = Mpsc.bounded(4096);
+
+    /**
+     * Prevents direct instantiation of this benchmark entry point.
+     */
+    private Main() {}
+
+    /**
+     * Benchmark runner entry point.
+     *
+     * @param args Command-line arguments.
+     * @throws Exception If benchmark execution fails.
+     */
+    static void main(String[] args) throws Exception {
+        Runtime.Config config = Runtime.Config.DEFAULT with {
+            threads = 4,
+            blockingThreads = 4
+        };
+        Runtime rt = Runtime.create(config);
+        rt.blockOn(Main.runAll());
+        rt.shutdown();
+    }
+
+    /**
+     * Executes all benchmark suites.
+     *
+     * @throws Exception If any benchmark step fails.
+     */
+    static async void runAll() throws Exception {
+        Console.println("=== Tide Runtime Benchmark ===");
+        await Main.benchTaskSpawn(10000);
+        await Main.benchChannelThroughput(50000);
+        Console.println("=== Benchmark Completed Successfully ===");
+    }
+
+    /**
+     * Benchmarks high-volume task spawning and joining.
+     *
+     * @param count Number of tasks to spawn.
+     * @throws Exception If task execution fails.
+     */
+    private static async void benchTaskSpawn(int count) throws Exception {
+        long start = System.currentTimeMillis();
+        List<JoinHandle<int>> tasks = new ArrayList<>();
+        for (int i = 0; i < count; i++) {
+            tasks.add(Tide.spawn(Main.computeTask(i)));
+        }
+        int total = 0;
+        while (tasks.size() > 0) {
+            total += await tasks.remove(0);
+        }
+        long duration = System.currentTimeMillis() - start;
+        if (duration == 0L) {
+            duration = 1L;
+        }
+        long rate = ((long) count * 1000L) / duration;
+        Console.println("Spawn & Join: $count tasks in ${duration}ms ($rate tasks/sec)");
+    }
+
+    /**
+     * Simple compute task used in spawn benchmark.
+     *
+     * @param x Input number.
+     * @return Doubled number.
+     */
+    private static async int computeTask(int x) {
+        return x * 2;
+    }
+
+    /**
+     * Benchmarks message passing throughput through an MPSC channel.
+     *
+     * @param count Number of messages to transmit.
+     * @throws Exception If sending or receiving fails.
+     */
+    private static async void benchChannelThroughput(int count) throws Exception {
+        Receiver<int> rx = Main.BENCH_CH.receiver();
+
+        long start = System.currentTimeMillis();
+        JoinHandle<Unit> producer = Tide.spawn(Main.produceMessages(count));
+
+        int received = 0;
+        while (received < count) {
+            int? val = await rx.receive();
+            if (val != null) {
+                received++;
+            }
+        }
+        await producer;
+
+        long duration = System.currentTimeMillis() - start;
+        if (duration == 0L) {
+            duration = 1L;
+        }
+        long rate = ((long) count * 1000L) / duration;
+        Console.println("MPSC Channel: $count msgs in ${duration}ms ($rate msgs/sec)");
+    }
+
+    /**
+     * Producer worker that transmits count messages into the MPSC channel.
+     *
+     * @param count Number of messages to send.
+     * @return Unit upon completion.
+     * @throws Exception If send fails.
+     */
+    private static async Unit produceMessages(int count) throws Exception {
+        Sender<int> tx = Main.BENCH_CH.sender();
+        for (int i = 0; i < count; i++) {
+            await tx.send(i);
+        }
+        return new Unit();
+    }
+}

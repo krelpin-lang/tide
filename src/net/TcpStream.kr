@@ -1,0 +1,265 @@
+package tide.net;
+
+import std.io.IOException;
+import std.net.Poller;
+import std.net.SocketAddr;
+import std.task.Unit;
+import tide.io.AsyncRead;
+import tide.io.AsyncWrite;
+import tide.io.Split;
+import tide.reactor.ReadReady;
+import tide.reactor.WriteReady;
+import tide.runtime.Handle;
+
+/**
+ * Asynchronous TCP stream connection between a local socket and a remote peer.
+ * Implements {@link AsyncRead} and {@link AsyncWrite}.
+ */
+final class TcpStream implements AsyncRead, AsyncWrite {
+    private final int token;
+    private std.net.TcpStream raw;
+    private boolean closed;
+
+    /**
+     * Constructs a TcpStream wrapping a raw TCP socket and reactor registration token.
+     *
+     * @param token Reactor registration token.
+     * @param raw Raw network stream.
+     */
+    private TcpStream(int token, std.net.TcpStream raw) {
+        this.token = token;
+        this.raw = raw;
+        this.closed = false;
+    }
+
+    /**
+     * Wraps a raw non-blocking socket stream with a reactor token.
+     *
+     * @param token Reactor registration token.
+     * @param raw Raw socket stream.
+     * @return Asynchronous TcpStream instance.
+     */
+    static TcpStream fromRaw(int token, std.net.TcpStream raw) {
+        return new TcpStream(token, raw);
+    }
+
+    /**
+     * Asynchronously establishes a TCP connection to the specified remote address.
+     *
+     * @param address Remote host address string (e.g. "127.0.0.1:8080").
+     * @return Connected TcpStream.
+     * @throws IOException If connection initiation or completion fails.
+     */
+    static async TcpStream connect(String address) throws IOException {
+        std.net.TcpStream raw = std.net.TcpStream.startConnect(address);
+        int token = Handle.current().registerStream(&mut raw, Poller.Interest.WRITABLE);
+        if (!raw.finishConnect()) {
+            Handle.current().clearWritable(token);
+            await new WriteReady(token);
+            while (!raw.finishConnect()) {
+                Handle.current().clearWritable(token);
+                await new WriteReady(token);
+            }
+        }
+        Handle.current().reregisterStream(&mut raw, token, Poller.Interest.READ_WRITE);
+        return new TcpStream(token, raw);
+    }
+
+    /**
+     * Splits this stream into independent read and write halves.
+     *
+     * @return Split object containing readHalf() and writeHalf().
+     */
+    move Split<TcpStream> split() {
+        return new Split<>(this);
+    }
+
+    /**
+     * Asynchronously reads up to {@code max} bytes into a newly allocated byte array.
+     *
+     * @param max Maximum number of bytes to read.
+     * @return Array of read bytes, or empty array if EOF reached.
+     * @throws IOException If read fails.
+     */
+    @Override
+    mut async byte[] read(int max) throws IOException {
+        while (true) {
+            byte[]? bytes = this.raw.tryRead(max);
+            if (bytes != null) {
+                return bytes;
+            }
+            if (this.raw.atEnd()) {
+                return new byte[0];
+            }
+            Handle.current().clearReadable(this.token);
+            await new ReadReady(this.token);
+        }
+    }
+
+    /**
+     * Asynchronously writes a slice of bytes to the socket.
+     *
+     * @param bytes Byte slice to transmit.
+     * @return Number of bytes actually written.
+     * @throws IOException If write fails.
+     */
+    @Override
+    mut async int write(&byte[] bytes) throws IOException {
+        if (bytes.length == 0) {
+            return 0;
+        }
+        while (true) {
+            int sent = this.raw.tryWrite(bytes, 0);
+            if (sent > 0) {
+                return sent;
+            }
+            Handle.current().clearWritable(this.token);
+            await new WriteReady(this.token);
+        }
+    }
+
+    /**
+     * Flushes buffered write data.
+     *
+     * @return Unit upon flush completion.
+     * @throws IOException If flush fails.
+     */
+    @Override
+    mut async Unit flush() throws IOException {
+        return new Unit();
+    }
+
+    /**
+     * Asynchronously reads a line of text terminated by newline.
+     *
+     * @return Line string without delimiter, or {@code null} on EOF.
+     * @throws IOException If read fails.
+     */
+    mut async String? readLine() throws IOException {
+        while (true) {
+            String? line = this.raw.tryReadLine();
+            if (line != null) {
+                return line;
+            }
+            if (this.raw.atEnd()) {
+                return null;
+            }
+            Handle.current().clearReadable(this.token);
+            await new ReadReady(this.token);
+        }
+    }
+
+    /**
+     * Asynchronously reads all remaining data until EOF as a UTF-8 string.
+     *
+     * @return Decoded string.
+     * @throws IOException If read fails.
+     */
+    mut async String readAll() throws IOException {
+        String result = "";
+        while (true) {
+            byte[] bytes = await this.read(4096);
+            if (bytes.length == 0) {
+                break;
+            }
+            String? decoded = String.fromUtf8(&bytes);
+            if (decoded != null) {
+                result = result + decoded;
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Asynchronously writes all bytes from the provided slice to the stream.
+     *
+     * @param bytes Data bytes to transmit completely.
+     * @throws IOException If write fails.
+     */
+    mut async void writeAll(&byte[] bytes) throws IOException {
+        int sent = 0;
+        while (sent < bytes.length) {
+            int n = this.raw.tryWrite(bytes, sent);
+            sent += n;
+            if (sent < bytes.length) {
+                Handle.current().clearWritable(this.token);
+                await new WriteReady(this.token);
+            }
+        }
+    }
+
+    /**
+     * Queues and transmits text data until flushed.
+     *
+     * @param text Text to send.
+     * @throws IOException If write fails.
+     */
+    mut async void writeText(String text) throws IOException {
+        this.raw.queue(text);
+        while (!this.raw.flush()) {
+            Handle.current().clearWritable(this.token);
+            await new WriteReady(this.token);
+        }
+    }
+
+    /**
+     * Shuts down the write half of this TCP connection.
+     *
+     * @throws IOException If socket shutdown fails.
+     */
+    mut void shutdownWrite() throws IOException {
+        this.raw.shutdownWrite();
+    }
+
+    /**
+     * Sets or disables the TCP_NODELAY socket option (disables Nagle's algorithm).
+     *
+     * @param noDelay {@code true} to disable delay; {@code false} to enable.
+     * @throws IOException If setting socket option fails.
+     */
+    mut void setNoDelay(boolean noDelay) throws IOException {
+        this.raw.setNoDelay(noDelay);
+    }
+
+    /**
+     * Returns the remote peer's socket address.
+     *
+     * @return Remote SocketAddr.
+     * @throws IOException If retrieving socket info fails.
+     */
+    SocketAddr peerAddr() throws IOException {
+        return this.raw.peerAddr();
+    }
+
+    /**
+     * Returns the local socket address.
+     *
+     * @return Local SocketAddr.
+     * @throws IOException If retrieving socket info fails.
+     */
+    SocketAddr localAddr() throws IOException {
+        return this.raw.localAddr();
+    }
+
+    /**
+     * Checks whether the stream has encountered EOF.
+     *
+     * @return {@code true} if at EOF; {@code false} otherwise.
+     */
+    boolean atEnd() {
+        return this.raw.atEnd();
+    }
+
+    /**
+     * Closes the TCP connection and deregisters it from the runtime reactor.
+     */
+    mut void close() {
+        if (this.closed) {
+            return;
+        }
+        this.closed = true;
+        try {
+            Handle.current().deregisterStream(&mut this.raw, this.token);
+        } catch (IOException e) {}
+    }
+}

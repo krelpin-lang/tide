@@ -1,0 +1,49 @@
+package tide.channel.mpsc;
+
+/**
+ * Sending handle for an {@link Mpsc} channel. Multiple sender instances can be cloned
+ * and distributed among concurrent tasks.
+ *
+ * @param <T> Transferred message type.
+ */
+final class Sender<T> borrows channel {
+    private final &Mpsc<T> channel;
+
+    /**
+     * Constructs a Sender borrowing the parent MPSC channel.
+     *
+     * @param channel Parent MPSC channel.
+     */
+    Sender(&Mpsc<T> channel) keeps channel {
+        this.channel = channel;
+    }
+
+    /**
+     * Attempts to send a value without suspending.
+     *
+     * @param val Value to transmit.
+     * @return {@code true} if queued; {@code false} if full or closed.
+     */
+    boolean trySend(T val) {
+        return this.channel.trySend(val);
+    }
+
+    /**
+     * Asynchronously sends a value into the channel, applying backpressure if full.
+     *
+     * @param val Value to transmit.
+     * @return SendFuture resolving with {@link std.task.Unit} once enqueued.
+     */
+    SendFuture<T> send(T val) borrows this {
+        return new SendFuture<>(this.channel, val);
+    }
+
+    /**
+     * Clones this sender handle, producing a new sender pointing to the same channel.
+     *
+     * @return Cloned Sender instance.
+     */
+    Sender<T> copy() borrows this {
+        return this.channel.sender();
+    }
+}

@@ -1,0 +1,109 @@
+package tide.runtime;
+
+import std.lang.Objects;
+import std.task.Waker;
+
+/**
+ * Internal shared control state for asynchronous tasks managed by {@code JoinHandle}.
+ * Tracks completion status, return value, propagated error, abortion, and join waker.
+ */
+final class TaskControl {
+    private Object? value;
+    private Exception? error;
+    private boolean finished;
+    private boolean aborted;
+    private Waker? joinWaker;
+
+    /**
+     * Initializes a new uncompleted task control block.
+     */
+    TaskControl() {
+        this.value = null;
+        this.error = null;
+        this.finished = false;
+        this.aborted = false;
+        this.joinWaker = null;
+    }
+
+    /**
+     * Checks whether the task has terminated (either via success, error, or abort).
+     *
+     * @return {@code true} if finished; {@code false} otherwise.
+     */
+    boolean isFinished() {
+        return this.finished;
+    }
+
+    /**
+     * Checks whether the task was explicitly aborted before normal completion.
+     *
+     * @return {@code true} if aborted; {@code false} otherwise.
+     */
+    boolean isAborted() {
+        return this.aborted;
+    }
+
+    /**
+     * Takes any unhandled error produced by the task execution.
+     *
+     * @return The error if present, or {@code null}.
+     */
+    mut Exception? takeError() {
+        return Objects.take(&mut this.error);
+    }
+
+    /**
+     * Marks the task as aborted and transitions it to finished state.
+     */
+    mut void abort() {
+        this.aborted = true;
+        this.finished = true;
+    }
+
+    /**
+     * Completes the task successfully with the given value.
+     *
+     * @param val The resolved return value.
+     */
+    mut void finish(Object? val) {
+        this.value = val;
+        this.finished = true;
+    }
+
+    /**
+     * Completes the task exceptionally with the given error.
+     *
+     * @param error The exception that caused failure.
+     */
+    mut void fail(Exception error) {
+        this.error = error;
+        this.finished = true;
+    }
+
+    /**
+     * Registers a waker to be notified when this task finishes.
+     *
+     * @param waker The join future's waker.
+     */
+    mut void joinWaker(Waker waker) {
+        this.joinWaker = waker;
+    }
+
+    /**
+     * Takes and clears the registered join waker.
+     *
+     * @return The join waker if registered.
+     */
+    mut Waker? takeJoinWaker() {
+        return Objects.take(&mut this.joinWaker);
+    }
+
+    /**
+     * Takes and clears the computed return value.
+     *
+     * @return The task result.
+     */
+    mut Object? takeValue() {
+        return Objects.take(&mut this.value);
+    }
+}

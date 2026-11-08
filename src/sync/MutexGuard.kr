@@ -1,0 +1,75 @@
+package tide.sync;
+
+import std.lang.AutoCloseable;
+import std.lang.Objects;
+
+/**
+ * RAII guard returned when acquiring an asynchronous {@link Mutex}.
+ * Holding this guard guarantees exclusive access to the protected value.
+ * Automatically releases the mutex upon leaving scope via {@link AutoCloseable}.
+ *
+ * @param <T> Protected data type.
+ */
+final class MutexGuard<T> borrows mutex implements AutoCloseable {
+    private final &Mutex<T> mutex;
+    private boolean active;
+
+    /**
+     * Constructs a MutexGuard borrowing the parent Mutex.
+     *
+     * @param mutex Parent mutex.
+     */
+    MutexGuard(&Mutex<T> mutex) keeps mutex {
+        this.mutex = mutex;
+        this.active = true;
+    }
+
+    /**
+     * Automatically invoked by the runtime when this guard is dropped, releasing the mutex.
+     */
+    @Override
+    mut void close() {
+        if (this.active) {
+            this.active = false;
+            this.mutex.unlock();
+        }
+    }
+
+    /**
+     * Manually releases the lock before leaving scope.
+     */
+    mut void unlockEarly() {
+        if (this.active) {
+            this.active = false;
+            this.mutex.unlock();
+        }
+    }
+
+    /**
+     * Mutates the protected value in-place.
+     *
+     * @param action Mutation callback.
+     */
+    mut void modify(Mutex.Action<T> action) {
+        this.mutex.modify(action);
+    }
+
+    /**
+     * Inspects or maps the protected value.
+     *
+     * @param func Mapping callback.
+     * @return Computed result.
+     */
+    mut <R> R map(Mutex.Func<T, R> func) {
+        return this.mutex.map(func);
+    }
+
+    /**
+     * Replaces the protected value.
+     *
+     * @param val New value.
+     */
+    mut void set(T val) {
+        this.mutex.set(val);
+    }
+}

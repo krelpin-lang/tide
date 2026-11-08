@@ -1,0 +1,38 @@
+package tide.sync;
+
+import std.task.Context;
+import std.task.Future;
+import std.task.Poll;
+
+/**
+ * Future returned by {@link Semaphore#acquire()}, resolving to a {@link SemaphorePermit}
+ * once the requested permits become available.
+ */
+final class SemaphoreFuture borrows semaphore implements Future<SemaphorePermit> {
+    private final &Semaphore semaphore;
+    private final int needed;
+    private boolean registered;
+
+    /**
+     * Constructs a SemaphoreFuture borrowing the parent Semaphore.
+     *
+     * @param semaphore Parent semaphore.
+     * @param needed Number of permits required.
+     */
+    SemaphoreFuture(&Semaphore semaphore, int needed) keeps semaphore {
+        this.semaphore = semaphore;
+        this.needed = needed;
+        this.registered = false;
+    }
+
+    /**
+     * Polls the semaphore for permit acquisition.
+     *
+     * @param cx Polling context with task waker.
+     * @return {@code Poll.Ready} with permit when acquired; {@code Poll.Pending} otherwise.
+     */
+    @Override
+    mut Poll<SemaphorePermit> poll(&mut Context cx) {
+        return this.semaphore.pollAcquire(this.needed, &mut this.registered, cx.waker());
+    }
+}

@@ -1,0 +1,223 @@
+package tide;
+
+import std.function.Supplier;
+import std.task.Future;
+import std.time.Duration;
+import std.time.Instant;
+import tide.runtime.Handle;
+import tide.runtime.JoinHandle;
+import tide.runtime.Runtime;
+import tide.runtime.YieldNow;
+import tide.time.Interval;
+import tide.time.Sleep;
+import tide.time.Timeout;
+
+/**
+ * Primary public facade for the Tide asynchronous runtime.
+ * Provides static entry points for blocking execution, detached task spawning,
+ * timers, asynchronous combinators, signals, and runtime metrics.
+ */
+final class Tide {
+    /**
+     * Prevents direct instantiation of this static utility class.
+     */
+    private Tide() {}
+
+    /**
+     * Executes the given future to completion on a default multi-threaded runtime.
+     * Blocks the calling thread until the future resolves or throws.
+     *
+     * @param future The root future to execute.
+     * @return The completed future's return value.
+     * @throws Exception If the future terminates with an exception.
+     */
+    static <T> T blockOn(Future<T> future) throws Exception {
+        return Runtime.execute(future);
+    }
+
+    /**
+     * Executes the given future to completion using custom runtime configuration.
+     *
+     * @param config Custom runtime configuration.
+     * @param future The root future to execute.
+     * @return The completed future's return value.
+     * @throws Exception If the future terminates with an exception.
+     */
+    static <T> T blockOn(Runtime.Config config, Future<T> future) throws Exception {
+        return Runtime.execute(config, future);
+    }
+
+    /**
+     * Spawns a detached asynchronous task on the current runtime.
+     *
+     * @param future The task future to schedule.
+     * @return A JoinHandle to await the task result or cancel execution.
+     */
+    static <T> JoinHandle<T> spawn(Future<T> future) keeps future {
+        return Runtime.spawnDetached(future);
+    }
+
+    /**
+     * Schedules a blocking action onto the runtime's dedicated blocking worker pool.
+     * Prevents synchronous I/O or heavy computations from starving async worker threads.
+     *
+     * @param action The blocking action to execute.
+     * @return A JoinHandle to await the result or cancel.
+     */
+    static <T> JoinHandle<T> spawnBlocking(tide.runtime.BlockingAction<T> action) keeps action {
+        return Runtime.spawnBlockingDetached(action);
+    }
+
+    /**
+     * Obtains the handle to the ambient Tide runtime for the current thread.
+     *
+     * @return The active runtime handle.
+     */
+    static Handle current() {
+        return Handle.current();
+    }
+
+    /**
+     * Cooperatively yields execution back to the runtime scheduler.
+     *
+     * @return A future that resolves after re-enqueuing the current task.
+     */
+    static YieldNow yieldNow() {
+        return Runtime.yieldNow();
+    }
+
+    /**
+     * Creates an asynchronous future that completes after the specified duration.
+     *
+     * @param duration Duration to sleep.
+     * @return The sleep future.
+     */
+    static Sleep sleep(Duration duration) {
+        return Sleep.after(duration);
+    }
+
+    /**
+     * Creates an asynchronous future that completes after the specified milliseconds.
+     *
+     * @param millis Milliseconds to sleep.
+     * @return The sleep future.
+     */
+    static Sleep sleepMillis(long millis) {
+        return Sleep.afterMillis(millis);
+    }
+
+    /**
+     * Creates an asynchronous future that completes when the specified deadline is reached.
+     *
+     * @param deadline Instant after which the future completes.
+     * @return The sleep future.
+     */
+    static Sleep sleepUntil(Instant deadline) {
+        return Sleep.until(deadline);
+    }
+
+    /**
+     * Wraps a future with an execution timeout duration.
+     *
+     * @param duration Maximum allowed execution time.
+     * @param future The underlying future.
+     * @return The timeout future.
+     */
+    static <T> Timeout<T> timeout(Duration duration, Future<T> future) keeps future {
+        return Timeout.after(duration, future);
+    }
+
+    /**
+     * Wraps a future with an execution timeout in milliseconds.
+     *
+     * @param millis Maximum allowed execution time in milliseconds.
+     * @param future The underlying future.
+     * @return The timeout future.
+     */
+    static <T> Timeout<T> timeoutMillis(long millis, Future<T> future) keeps future {
+        return Timeout.afterMillis(millis, future);
+    }
+
+    /**
+     * Creates a periodic timer interval ticking every given duration.
+     *
+     * @param period Interval duration between ticks.
+     * @return The interval instance.
+     */
+    static Interval interval(Duration period) {
+        return Interval.every(period);
+    }
+
+    /**
+     * Creates a periodic timer interval ticking every given millisecond interval.
+     *
+     * @param millis Interval period in milliseconds.
+     * @return The interval instance.
+     */
+    static Interval intervalMillis(long millis) {
+        return Interval.everyMillis(millis);
+    }
+
+    /**
+     * Creates an asynchronous signal future waiting for process interrupt (Ctrl-C / SIGINT).
+     *
+     * @return A signal future resolving on SIGINT.
+     */
+    static tide.signal.Signal.CtrlC ctrlC() {
+        return tide.signal.Signal.ctrlC();
+    }
+
+    /**
+     * Concurrently runs two futures to completion and returns their combined results as a pair.
+     *
+     * @param a The first future.
+     * @param b The second future.
+     * @return A pair containing both resolved values.
+     */
+    static async <A, B> tide.future.Pair<A, B> join(Future<A> a, Future<B> b) keeps a, b throws Exception {
+        return await tide.future.Join.join(a, b);
+    }
+
+    /**
+     * Concurrently runs three futures to completion and returns their combined results as a 3-tuple.
+     *
+     * @param a The first future.
+     * @param b The second future.
+     * @param c The third future.
+     * @return A 3-tuple containing all three resolved values.
+     */
+    static async <A, B, C> tide.future.Tuple3<A, B, C> join3(Future<A> a, Future<B> b, Future<C> c) keeps a, b, c throws Exception {
+        return await tide.future.Join.join3(a, b, c);
+    }
+
+    /**
+     * Concurrently runs a list of futures to completion and collects all results.
+     *
+     * @param futures The list of futures to join.
+     * @return A list containing all resolved values in order.
+     */
+    static async <T> std.util.List<T> joinAll(std.util.List<Future<T>> futures) keeps futures throws Exception {
+        return await tide.future.Join.joinAll(futures);
+    }
+
+    /**
+     * Races two futures concurrently, returning when either one completes first.
+     * The slower branch is cancelled.
+     *
+     * @param a The first future branch.
+     * @param b The second future branch.
+     * @return A select future yielding Select2 indicating which branch won.
+     */
+    static <A, B> tide.future.Select2Future<A, B> select(Future<A> a, Future<B> b) {
+        return tide.future.Select.select(a, b);
+    }
+
+    /**
+     * Retrieves the runtime metrics snapshot for the current runtime.
+     *
+     * @return Current RuntimeMetrics snapshot.
+     */
+    static tide.metrics.RuntimeMetrics metrics() {
+        return Handle.current().metrics();
+    }
+}

@@ -1,0 +1,37 @@
+package tide.channel.oneshot;
+
+import std.io.IOException;
+import std.task.Context;
+import std.task.Future;
+import std.task.Poll;
+
+/**
+ * Receiving endpoint of a {@link Oneshot} channel.
+ * Implements {@link Future}, allowing callers to await the transmitted value directly.
+ *
+ * @param <T> Transferred value type.
+ */
+final class Receiver<T> borrows channel implements Future<T> {
+    private final &Oneshot<T> channel;
+
+    /**
+     * Constructs a Receiver borrowing the parent Oneshot channel.
+     *
+     * @param channel Parent oneshot channel.
+     */
+    Receiver(&Oneshot<T> channel) keeps channel {
+        this.channel = channel;
+    }
+
+    /**
+     * Polls for arrival of the value.
+     *
+     * @param cx Task polling context.
+     * @return {@code Poll.Ready} with value when received; {@code Poll.Pending} otherwise.
+     * @throws IOException If the sender closed without sending a value.
+     */
+    @Override
+    mut Poll<T> poll(&mut Context cx) throws IOException {
+        return this.channel.pollReceive(cx.waker());
+    }
+}

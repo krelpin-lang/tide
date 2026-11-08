@@ -1,0 +1,40 @@
+package tide.channel.broadcast;
+
+import std.lang.Cloneable;
+
+/**
+ * Sending handle for a {@link Broadcast} channel.
+ *
+ * @param <T> Transferred message type.
+ */
+final class Sender<T extends Cloneable<T>> borrows channel {
+    private final &Broadcast<T> channel;
+
+    /**
+     * Constructs a Sender borrowing the parent broadcast channel.
+     *
+     * @param channel Parent broadcast channel.
+     */
+    Sender(&Broadcast<T> channel) keeps channel {
+        this.channel = channel;
+    }
+
+    /**
+     * Broadcasts a message to all active subscribers.
+     *
+     * @param val Message to broadcast.
+     * @return Number of active subscribers receiving the message.
+     */
+    int send(T val) {
+        return this.channel.send(val);
+    }
+
+    /**
+     * Subscribes a new receiver from this sender handle.
+     *
+     * @return New Receiver instance.
+     */
+    Receiver<T> subscribe() borrows this {
+        return this.channel.subscribe();
+    }
+}

@@ -1,0 +1,37 @@
+package tide.sync;
+
+import std.task.Context;
+import std.task.Future;
+import std.task.Poll;
+
+/**
+ * Future returned by {@link RwLock#write()}, resolving to an {@link RwLockWriteGuard} once
+ * exclusive write access is granted.
+ *
+ * @param <T> Protected data type.
+ */
+final class RwLockWriteFuture<T> borrows lock implements Future<RwLockWriteGuard<T>> {
+    private final &RwLock<T> lock;
+    private boolean registered;
+
+    /**
+     * Constructs an RwLockWriteFuture borrowing the parent RwLock.
+     *
+     * @param lock Parent reader-writer lock.
+     */
+    RwLockWriteFuture(&RwLock<T> lock) keeps lock {
+        this.lock = lock;
+        this.registered = false;
+    }
+
+    /**
+     * Polls for exclusive write lock acquisition.
+     *
+     * @param cx Context with task waker.
+     * @return {@code Poll.Ready} with write guard when acquired; {@code Poll.Pending} otherwise.
+     */
+    @Override
+    mut Poll<RwLockWriteGuard<T>> poll(&mut Context cx) {
+        return this.lock.pollWrite(&mut this.registered, cx.waker());
+    }
+}

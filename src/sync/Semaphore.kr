@@ -1,0 +1,137 @@
+package tide.sync;
+
+import std.task.Poll;
+import std.task.Waker;
+import std.util.ArrayDeque;
+import std.util.ArrayList;
+import std.util.List;
+
+/**
+ * An asynchronous counting semaphore for controlling concurrent access to a shared resource pool.
+ * Acquired permits are returned as {@link SemaphorePermit} instances that automatically release
+ * their permits upon leaving scope via {@link std.lang.AutoCloseable}.
+ */
+final class Semaphore {
+    private final std.sync.Mutex<State> inner;
+
+    /**
+     * Waiting permit request queued in the semaphore.
+     */
+    private static final class Waiter {
+        final int needed;
+        final Waker waker;
+
+        /**
+         * Constructs a Waiter record with needed permits and task waker.
+         *
+         * @param needed Number of permits required.
+         * @param waker Task waker to awaken once permits become available.
+         */
+        Waiter(int needed, Waker waker) {
+            this.needed = needed;
+            this.waker = waker;
+        }
+    }
+
+    /**
+     * Internal state tracking available permits and queued permit requests.
+     */
+    private static final class State {
+        int permits;
+        ArrayDeque<Waiter> waiters;
+
+        /**
+         * Constructs initial semaphore state with the given permit count.
+         *
+         * @param initialPermits Initial permit count.
+         */
+        State(int initialPermits) {
+            this.permits = initialPermits;
+            this.waiters = new ArrayDeque<>();
+        }
+    }
+
+    /**
+     * Constructs a Semaphore initialized with the specified permit count.
+     *
+     * @param initialPermits Initial available permit count.
+     */
+    Semaphore(int initialPermits) {
+        this.inner = new std.sync.Mutex<>(new State(initialPermits));
+    }
+
+    /**
+     * Returns the current number of available permits.
+     *
+     * @return Number of available permits.
+     */
+    int availablePermits() {
+        std.sync.Mutex.Guard<State> guard = this.inner.lock();
+        return guard.get().permits;
+    }
+
+    /**
+     * Asynchronously acquires a single permit.
+     *
+     * @return Future resolving to a SemaphorePermit holding 1 permit.
+     */
+    SemaphoreFuture acquire() borrows this {
+        return this.acquire(1);
+    }
+
+    /**
+     * Asynchronously acquires {@code count} permits.
+     *
+     * @param count Number of permits to acquire.
+     * @return Future resolving to a SemaphorePermit holding {@code count} permits.
+     */
+    SemaphoreFuture acquire(int count) borrows this {
+        return new SemaphoreFuture(this, count);
+    }
+
+    /**
+     * Polls acquisition of the requested number of permits.
+     *
+     * @param count Number of permits requested.
+     * @param registered Whether caller's waker has been enqueued in the waiter list.
+     * @param waker Task waker to awaken when permits are released.
+     * @return Ready with SemaphorePermit if acquired; Pending otherwise.
+     */
+    Poll<SemaphorePermit> pollAcquire(int count, &mut boolean registered, &Waker waker) borrows this {
+        std.sync.Mutex.Guard<State> guard = this.inner.lock();
+        &mut State s = guard.getMut();
+        if (s.permits >= count) {
+            s.permits -= count;
+            return Poll.Ready(new SemaphorePermit(this, count));
+        }
+        s.waiters.add(new Waiter(count, waker.copy()));
+        return Poll.Pending;
+    }
+
+    /**
+     * Releases a single permit back to the semaphore, waking any waiting tasks.
+     */
+    void release() {
+        this.release(1);
+    }
+
+    /**
+     * Releases {@code count} permits back to the semaphore, waking waiting tasks.
+     *
+     * @param count Number of permits to return.
+     */
+    void release(int count) {
+        List<Waker> toWake = new ArrayList<>();
+        {
+            std.sync.Mutex.Guard<State> guard = this.inner.lock();
+            &mut State s = guard.getMut();
+            s.permits += count;
+            while (s.waiters.size() > 0) {
+                toWake.add(s.waiters.remove().waker);
+            }
+        }
+        for (int i = 0; i < toWake.size(); i++) {
+            toWake.get(i).wake();
+        }
+    }
+}

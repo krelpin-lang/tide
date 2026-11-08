@@ -1,0 +1,35 @@
+package tide.channel.mpsc;
+
+/**
+ * Receiving handle for an {@link Mpsc} channel. Only one receiver exists per channel.
+ *
+ * @param <T> Transferred message type.
+ */
+final class Receiver<T> borrows channel {
+    private final &Mpsc<T> channel;
+
+    /**
+     * Constructs a Receiver borrowing the parent MPSC channel.
+     *
+     * @param channel Parent MPSC channel.
+     */
+    Receiver(&Mpsc<T> channel) keeps channel {
+        this.channel = channel;
+    }
+
+    /**
+     * Asynchronously receives the next message from the channel.
+     *
+     * @return RecvFuture yielding the message {@code T}, or {@code null} if all senders closed.
+     */
+    RecvFuture<T> receive() borrows this {
+        return new RecvFuture<>(this.channel);
+    }
+
+    /**
+     * Closes the channel from the receiver side.
+     */
+    void close() {
+        this.channel.close();
+    }
+}

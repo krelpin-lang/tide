@@ -1,0 +1,242 @@
+package tide.channel.mpsc;
+
+import std.io.IOException;
+import std.lang.Objects;
+import std.task.Poll;
+import std.task.Unit;
+import std.task.Waker;
+import std.util.ArrayDeque;
+import std.util.Queue;
+
+/**
+ * Multi-producer, single-consumer (MPSC) asynchronous channel supporting backpressure
+ * with bounded and unbounded queue capacities.
+ *
+ * @param <T> Transferred message type.
+ */
+final class Mpsc<T> {
+    private final int capacity;
+    private final std.sync.Mutex<State<T>> inner;
+
+    /**
+     * Internal state container for the MPSC channel.
+     *
+     * @param <T> Transferred message type.
+     */
+    private static final class State<T> {
+        Queue<T> queue;
+        boolean closed;
+        int senders;
+        Queue<Waker> sendWaiters;
+        Waker? recvWaiter;
+
+        /**
+         * Constructs an initial open MPSC state with 1 active sender.
+         */
+        State() {
+            this.queue = new ArrayDeque<>();
+            this.closed = false;
+            this.senders = 1;
+            this.sendWaiters = new ArrayDeque<>();
+            this.recvWaiter = null;
+        }
+    }
+
+    /**
+     * Constructs an MPSC channel with the specified queue capacity.
+     *
+     * @param capacity Queue buffer limit.
+     */
+    private Mpsc(int capacity) {
+        this.capacity = capacity;
+        this.inner = new std.sync.Mutex<>(new State<>());
+    }
+
+    /**
+     * Constructs a bounded MPSC channel with a fixed buffer capacity.
+     * Senders will suspend when the queue is full, applying backpressure.
+     *
+     * @param <T> Message type.
+     * @param capacity Maximum number of queued items.
+     * @return Bounded Mpsc channel.
+     */
+    static <T> Mpsc<T> bounded(int capacity) {
+        return new Mpsc<>(capacity);
+    }
+
+    /**
+     * Constructs an unbounded MPSC channel with virtually unlimited queue capacity.
+     * Senders never suspend.
+     *
+     * @param <T> Message type.
+     * @return Unbounded Mpsc channel.
+     */
+    static <T> Mpsc<T> unbounded() {
+        return new Mpsc<>(int.MAX_VALUE);
+    }
+
+    /**
+     * Creates and returns a new {@link Sender} handle for this channel.
+     * Multiple senders can be created and distributed across tasks.
+     *
+     * @return Sender instance.
+     */
+    Sender<T> sender() borrows this {
+        {
+            std.sync.Mutex.Guard<State<T>> guard = this.inner.lock();
+            guard.getMut().senders++;
+        }
+        return new Sender<>(this);
+    }
+
+    /**
+     * Returns the single {@link Receiver} handle for this channel.
+     *
+     * @return Receiver instance.
+     */
+    Receiver<T> receiver() borrows this {
+        return new Receiver<>(this);
+    }
+
+    /**
+     * Decrements the active sender reference count, waking any pending receiver if all senders have disconnected.
+     */
+    void dropSender() {
+        Waker? toWake = null;
+        {
+            std.sync.Mutex.Guard<State<T>> guard = this.inner.lock();
+            &mut State<T> s = guard.getMut();
+            s.senders--;
+            if (s.senders <= 0) {
+                toWake = Objects.take(&mut s.recvWaiter);
+            }
+        }
+        if (toWake != null) {
+            toWake.wake();
+        }
+    }
+
+    /**
+     * Closes the channel. All pending senders are awakened with an error,
+     * and future receives will drain remaining items and then return {@code null}.
+     */
+    void close() {
+        Waker? toRecv = null;
+        Queue<Waker>? toSend = null;
+        {
+            std.sync.Mutex.Guard<State<T>> guard = this.inner.lock();
+            &mut State<T> s = guard.getMut();
+            s.closed = true;
+            toRecv = Objects.take(&mut s.recvWaiter);
+            toSend = Objects.replace(&mut s.sendWaiters, new ArrayDeque<>());
+        }
+        if (toRecv != null) {
+            toRecv.wake();
+        }
+        if (toSend != null) {
+            while (toSend.size() > 0) {
+                toSend.remove().wake();
+            }
+        }
+    }
+
+    /**
+     * Non-blocking send. Attempts to enqueue a message immediately.
+     *
+     * @param val Message to enqueue.
+     * @return {@code true} if enqueued; {@code false} if full or closed.
+     */
+    boolean trySend(T val) {
+        Waker? toWake = null;
+        {
+            std.sync.Mutex.Guard<State<T>> guard = this.inner.lock();
+            &mut State<T> s = guard.getMut();
+            if (s.closed || s.queue.size() >= this.capacity) {
+                return false;
+            }
+            s.queue.add(val);
+            toWake = Objects.take(&mut s.recvWaiter);
+        }
+        if (toWake != null) {
+            toWake.wake();
+        }
+        return true;
+    }
+
+    /**
+     * Polls whether the value can be enqueued into the channel, applying backpressure if full.
+     *
+     * @param valHolder Mutable reference holding value to enqueue.
+     * @param registered Whether the sender waker has been registered in the send queue.
+     * @param waker Task waker to awaken when buffer capacity becomes available.
+     * @return Ready with Unit once enqueued; Pending if buffer is full.
+     * @throws IOException If channel is closed.
+     */
+    Poll<Unit> pollSend(&mut (T?) valHolder, &mut boolean registered, &Waker waker) borrows this throws IOException {
+        Waker? toWake = null;
+        {
+            std.sync.Mutex.Guard<State<T>> guard = this.inner.lock();
+            &mut State<T> s = guard.getMut();
+            if (s.closed) {
+                throw new IOException("mpsc channel is closed");
+            }
+            if (s.queue.size() < this.capacity) {
+                T? v = Objects.take(valHolder);
+                if (v != null) {
+                    s.queue.add(v);
+                }
+                toWake = Objects.take(&mut s.recvWaiter);
+            } else {
+                if (!registered) {
+                    s.sendWaiters.add(waker.copy());
+                    registered = true;
+                }
+                return Poll.Pending;
+            }
+        }
+        if (toWake != null) {
+            toWake.wake();
+        }
+        return Poll.Ready(new Unit());
+    }
+
+    /**
+     * Polls the next message from the channel buffer.
+     *
+     * @param waker Task waker to awaken when a message arrives.
+     * @return Ready with message or null if closed; Pending if currently empty.
+     */
+    Poll<T?> pollReceive(&Waker waker) borrows this {
+        Waker? toWake = null;
+        T? result = null;
+        {
+            std.sync.Mutex.Guard<State<T>> guard = this.inner.lock();
+            &mut State<T> s = guard.getMut();
+            if (s.queue.size() > 0) {
+                result = s.queue.remove();
+                if (s.sendWaiters.size() > 0) {
+                    toWake = s.sendWaiters.remove();
+                }
+            } else if (s.closed || s.senders <= 0) {
+                return Poll.Ready(null);
+            } else {
+                s.recvWaiter = waker.copy();
+                return Poll.Pending;
+            }
+        }
+        if (toWake != null) {
+            toWake.wake();
+        }
+        return Poll.Ready(result);
+    }
+
+    /**
+     * Returns the number of messages currently buffered in the queue.
+     *
+     * @return Queued message count.
+     */
+    int size() {
+        std.sync.Mutex.Guard<State<T>> guard = this.inner.lock();
+        return guard.get().queue.size();
+    }
+}

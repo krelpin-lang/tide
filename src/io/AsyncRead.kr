@@ -1,0 +1,16 @@
+package tide.io;
+
+import std.task.Future;
+
+/**
+ * Trait for types that provide asynchronous, non-blocking byte-stream reading capabilities.
+ */
+interface AsyncRead {
+    /**
+     * Asynchronously reads up to {@code maxBytes} from the underlying byte stream.
+     *
+     * @param maxBytes Maximum number of bytes to retrieve.
+     * @return Future yielding a byte array containing read data, or empty array on EOF.
+     */
+    mut Future<byte[]> read(int maxBytes);
+}

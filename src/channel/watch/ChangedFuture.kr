@@ -1,0 +1,37 @@
+package tide.channel.watch;
+
+import std.task.Context;
+import std.task.Future;
+import std.task.Poll;
+import std.task.Unit;
+
+/**
+ * Future returned by {@link Receiver#changed()}, completing when the watched state is updated.
+ *
+ * @param <T> Watched state type.
+ */
+final class ChangedFuture<T> borrows receiver implements Future<Unit> {
+    private final &mut Receiver<T> receiver;
+    private boolean registered;
+
+    /**
+     * Constructs a ChangedFuture borrowing the mutable receiver handle.
+     *
+     * @param receiver Mutable receiver handle.
+     */
+    ChangedFuture(&mut Receiver<T> receiver) keeps receiver {
+        this.receiver = receiver;
+        this.registered = false;
+    }
+
+    /**
+     * Polls for version advancement on the watched state.
+     *
+     * @param cx Task polling context.
+     * @return {@code Poll.Ready} when state version advances; {@code Poll.Pending} otherwise.
+     */
+    @Override
+    mut Poll<Unit> poll(&mut Context cx) {
+        return this.receiver.pollChanged(&mut this.registered, cx.waker());
+    }
+}

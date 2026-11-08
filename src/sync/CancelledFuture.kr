@@ -1,0 +1,36 @@
+package tide.sync;
+
+import std.task.Context;
+import std.task.Future;
+import std.task.Poll;
+import std.task.Unit;
+
+/**
+ * Future returned by {@link CancellationToken#cancelled()}, completing once
+ * the cancellation token is triggered.
+ */
+final class CancelledFuture borrows token implements Future<Unit> {
+    private final &CancellationToken token;
+    private boolean registered;
+
+    /**
+     * Constructs a CancelledFuture borrowing the parent CancellationToken.
+     *
+     * @param token Parent cancellation token.
+     */
+    CancelledFuture(&CancellationToken token) keeps token {
+        this.token = token;
+        this.registered = false;
+    }
+
+    /**
+     * Polls the cancellation token for cancellation status.
+     *
+     * @param cx Task polling context.
+     * @return {@code Poll.Ready} if cancelled; {@code Poll.Pending} otherwise.
+     */
+    @Override
+    mut Poll<Unit> poll(&mut Context cx) {
+        return this.token.pollCancelled(&mut this.registered, cx.waker());
+    }
+}

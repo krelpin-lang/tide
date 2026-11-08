@@ -1,0 +1,136 @@
+package tide.io;
+
+import std.io.IOException;
+import std.util.ArrayList;
+import std.util.List;
+
+/**
+ * Buffered wrapper around an {@link AsyncRead} stream, providing efficient small-chunk reading
+ * and line-by-line text reading via an internal memory buffer.
+ *
+ * @param <R> Underlying asynchronous reader type.
+ */
+final class BufReader<R extends AsyncRead> implements AsyncRead {
+    private R reader;
+    private byte[] buffer;
+    private int pos;
+    private int cap;
+
+    /**
+     * Constructs a BufReader with a default buffer size (8192 bytes).
+     *
+     * @param reader Underlying reader.
+     */
+    BufReader(R reader) {
+        this(reader, 8192);
+    }
+
+    /**
+     * Constructs a BufReader with the specified buffer capacity.
+     *
+     * @param reader Underlying reader.
+     * @param capacity Buffer size in bytes.
+     */
+    BufReader(R reader, int capacity) {
+        this.reader = reader;
+        this.buffer = new byte[capacity];
+        this.pos = 0;
+        this.cap = 0;
+    }
+
+    /**
+     * Asynchronously reads up to {@code maxBytes} from the internal buffer,
+     * refilling it from the underlying reader as needed.
+     *
+     * @param maxBytes Maximum bytes to read.
+     * @return Read bytes, or empty array on EOF.
+     * @throws Exception If an I/O error occurs.
+     */
+    @Override
+    mut async byte[] read(int maxBytes) throws Exception {
+        if (this.pos < this.cap) {
+            int available = this.cap - this.pos;
+            int toRead = available < maxBytes ? available : maxBytes;
+            byte[] result = new byte[toRead];
+            Io.copyBytes(&this.buffer, this.pos, &mut result, 0, toRead);
+            this.pos += toRead;
+            return result;
+        }
+        this.pos = 0;
+        this.cap = 0;
+        byte[] chunk = await this.reader.read(this.buffer.length);
+        if (chunk.length == 0) {
+            return new byte[0];
+        }
+        int toRead = chunk.length < maxBytes ? chunk.length : maxBytes;
+        byte[] result = new byte[toRead];
+        Io.copyBytes(&chunk, 0, &mut result, 0, toRead);
+        int leftover = chunk.length - toRead;
+        if (leftover > 0) {
+            Io.copyBytes(&chunk, toRead, &mut this.buffer, 0, leftover);
+            this.pos = 0;
+            this.cap = leftover;
+        }
+        return result;
+    }
+
+    /**
+     * Asynchronously reads a line of text terminated by '\n'.
+     *
+     * @return Decoded line string without line terminator, or {@code null} on EOF.
+     * @throws Exception If an I/O error occurs.
+     */
+    mut async String? readLine() throws Exception {
+        List<byte[]> collected = new ArrayList<>();
+        int totalBytes = 0;
+        boolean foundNewline = false;
+        while (!foundNewline) {
+            if (this.pos >= this.cap) {
+                byte[] chunk = await this.reader.read(this.buffer.length);
+                if (chunk.length == 0) {
+                    break;
+                }
+                Io.copyBytes(&chunk, 0, &mut this.buffer, 0, chunk.length);
+                this.pos = 0;
+                this.cap = chunk.length;
+            }
+            int start = this.pos;
+            int end = this.pos;
+            while (end < this.cap && this.buffer[end] != 10) {
+                end++;
+            }
+            if (end < this.cap && this.buffer[end] == 10) {
+                int len = end - start;
+                byte[] slice = new byte[len];
+                Io.copyBytes(&this.buffer, start, &mut slice, 0, len);
+                collected.add(slice);
+                totalBytes += len;
+                this.pos = end + 1;
+                foundNewline = true;
+            } else {
+                int len = this.cap - start;
+                byte[] slice = new byte[len];
+                Io.copyBytes(&this.buffer, start, &mut slice, 0, len);
+                collected.add(slice);
+                totalBytes += len;
+                this.pos = this.cap;
+            }
+        }
+        if (totalBytes == 0 && !foundNewline) {
+            return null;
+        }
+        byte[] combined = new byte[totalBytes];
+        int offset = 0;
+        for (int i = 0; i < collected.size(); i++) {
+            &byte[] s = collected.get(i);
+            Io.copyBytes(s, 0, &mut combined, offset, s.length);
+            offset += s.length;
+        }
+        if (totalBytes > 0 && combined[totalBytes - 1] == 13) {
+            byte[] trimmed = new byte[totalBytes - 1];
+            Io.copyBytes(&combined, 0, &mut trimmed, 0, totalBytes - 1);
+            return String.fromUtf8(&trimmed);
+        }
+        return String.fromUtf8(&combined);
+    }
+}

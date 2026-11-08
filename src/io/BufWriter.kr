@@ -1,0 +1,90 @@
+package tide.io;
+
+import std.io.IOException;
+import std.task.Unit;
+
+/**
+ * Buffered wrapper around an {@link AsyncWrite} stream that accumulates output in a memory buffer
+ * to reduce the number of individual system calls.
+ *
+ * @param <W> Underlying asynchronous writer type.
+ */
+final class BufWriter<W extends AsyncWrite> implements AsyncWrite {
+    private W writer;
+    private byte[] buffer;
+    private int count;
+
+    /**
+     * Constructs a BufWriter with a default buffer size (8192 bytes).
+     *
+     * @param writer Underlying writer.
+     */
+    BufWriter(W writer) {
+        this(writer, 8192);
+    }
+
+    /**
+     * Constructs a BufWriter with the specified buffer capacity.
+     *
+     * @param writer Underlying writer.
+     * @param capacity Buffer capacity in bytes.
+     */
+    BufWriter(W writer, int capacity) {
+        this.writer = writer;
+        this.buffer = new byte[capacity];
+        this.count = 0;
+    }
+
+    /**
+     * Writes bytes into the internal buffer, automatically flushing to the underlying writer
+     * when the buffer fills.
+     *
+     * @param bytes Byte slice to write.
+     * @return Number of bytes accepted.
+     * @throws Exception If an I/O error occurs.
+     */
+    @Override
+    mut async int write(&byte[] bytes) throws Exception {
+        if (this.count + bytes.length <= this.buffer.length) {
+            Io.copyBytes(bytes, 0, &mut this.buffer, this.count, bytes.length);
+            this.count += bytes.length;
+            return bytes.length;
+        }
+        await this.flush();
+        if (bytes.length >= this.buffer.length) {
+            return await this.writer.write(bytes);
+        }
+        Io.copyBytes(bytes, 0, &mut this.buffer, 0, bytes.length);
+        this.count = bytes.length;
+        return bytes.length;
+    }
+
+    /**
+     * Flushes all currently buffered bytes to the underlying writer, then flushes the underlying writer.
+     *
+     * @return Unit upon flush completion.
+     * @throws Exception If an I/O error occurs.
+     */
+    @Override
+    mut async Unit flush() throws Exception {
+        if (this.count > 0) {
+            byte[] slice = new byte[this.count];
+            Io.copyBytes(&this.buffer, 0, &mut slice, 0, this.count);
+            await Io.writeAll(&mut this.writer, &slice);
+            this.count = 0;
+        }
+        await this.writer.flush();
+        return new Unit();
+    }
+
+    /**
+     * Writes a text string as UTF-8 bytes through this buffered writer.
+     *
+     * @param text String to write.
+     * @throws Exception If an I/O error occurs.
+     */
+    mut async void writeString(String text) throws Exception {
+        byte[] b = text.bytes();
+        await this.write(&b);
+    }
+}

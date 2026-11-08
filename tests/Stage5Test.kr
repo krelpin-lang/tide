@@ -1,0 +1,130 @@
+package tests;
+
+import std.task.Unit;
+import std.util.ArrayList;
+import std.util.List;
+import tide.Tide;
+import tide.metrics.RuntimeMetrics;
+import tide.net.TcpListener;
+import tide.net.TcpStream;
+import tide.runtime.JoinHandle;
+import tide.runtime.Runtime;
+
+final class Stage5Test {
+    private Stage5Test() {}
+
+    @Test
+    static void testRuntimeMetrics() throws Exception {
+        Tide.blockOn(Stage5Test.runMetricsTest());
+    }
+
+    private static async void runMetricsTest() throws Exception {
+        RuntimeMetrics initial = Tide.metrics();
+        Check.that(initial.spawnedTasks() >= 0L, "initial spawned tasks valid");
+
+        JoinHandle<int> h1 = Tide.spawn(Stage5Test.quickValue(10));
+        JoinHandle<int> h2 = Tide.spawn(Stage5Test.quickValue(20));
+
+        int v1 = await h1;
+        int v2 = await h2;
+        Check.equalInt(v1 + v2, 30);
+
+        RuntimeMetrics current = Tide.metrics();
+        Check.that(current.spawnedTasks() >= 2L, "spawned count tracked");
+        Check.that(current.completedTasks() >= 2L, "completed count tracked");
+    }
+
+    private static async int quickValue(int x) {
+        await Tide.yieldNow();
+        return x;
+    }
+
+    @Test
+    static void testHighConcurrencyTasks() throws Exception {
+        Tide.blockOn(Stage5Test.runHighConcurrencyTasksTest());
+    }
+
+    private static async void runHighConcurrencyTasksTest() throws Exception {
+        int count = 10000;
+        List<JoinHandle<int>> tasks = new ArrayList<>();
+        for (int i = 0; i < count; i++) {
+            tasks.add(Tide.spawn(Stage5Test.taskCompute(i)));
+        }
+
+        int total = 0;
+        while (tasks.size() > 0) {
+            total += await tasks.remove(0);
+        }
+        Check.that(total > 0, "all 10000 tasks executed and aggregated");
+    }
+
+    private static async int taskCompute(int index) {
+        if (index % 10 == 0) {
+            await Tide.yieldNow();
+        }
+        return index;
+    }
+
+    @Test
+    static void testConcurrentTcpConnections() throws Exception {
+        Tide.blockOn(Stage5Test.runConcurrentTcpTest());
+    }
+
+    private static async void runConcurrentTcpTest() throws Exception {
+        TcpListener listener = TcpListener.bind("127.0.0.1:0");
+        String addr = listener.localAddr().toString();
+        int clientCount = 20;
+
+        JoinHandle<Unit> server = Tide.spawn(Stage5Test.serveMultipleClients(listener, clientCount));
+
+        List<JoinHandle<Unit>> clients = new ArrayList<>();
+        for (int i = 0; i < clientCount; i++) {
+            clients.add(Tide.spawn(Stage5Test.runClient(addr, i)));
+        }
+
+        while (clients.size() > 0) {
+            await clients.remove(0);
+        }
+        await server;
+    }
+
+    private static async Unit serveMultipleClients(TcpListener listener, int count) throws Exception {
+        for (int i = 0; i < count; i++) {
+            TcpStream stream = await listener.accept();
+            Tide.spawn(Stage5Test.handleSingleEcho(stream));
+        }
+        listener.close();
+        return new Unit();
+    }
+
+    private static async Unit handleSingleEcho(TcpStream stream) throws Exception {
+        String? line = await stream.readLine();
+        if (line != null) {
+            await stream.writeText("$line\n");
+        }
+        stream.close();
+        return new Unit();
+    }
+
+    private static async Unit runClient(String addr, int id) throws Exception {
+        TcpStream stream = await TcpStream.connect(addr);
+        await stream.writeText("client-$id\n");
+        String? reply = await stream.readLine();
+        Check.that(reply != null && reply.contains("client-$id"), "client received echo reply");
+        stream.close();
+        return new Unit();
+    }
+
+    @Test
+    static void testGracefulShutdown() throws Exception {
+        Runtime.Config config = Runtime.Config.DEFAULT with {
+            threads = 2,
+            blockingThreads = 2
+        };
+        Runtime rt = Runtime.create(config);
+        int res = rt.blockOn(Stage5Test.quickValue(99));
+        Check.equalInt(res, 99);
+        rt.shutdown();
+        Check.that(rt.isShutdown(), "runtime is shutdown");
+    }
+}

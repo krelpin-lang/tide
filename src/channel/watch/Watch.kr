@@ -1,0 +1,154 @@
+package tide.channel.watch;
+
+import std.lang.Objects;
+import std.task.Poll;
+import std.task.Unit;
+import std.task.Waker;
+import std.util.ArrayList;
+import std.util.List;
+
+/**
+ * Single-producer, multi-consumer watch channel that retains only the latest value
+ * and notifies receivers whenever the value is updated.
+ *
+ * @param <T> Watched state type.
+ */
+final class Watch<T> {
+    private final std.sync.Mutex<State<T>> inner;
+
+    /**
+     * Internal container holding the latest value and version counter.
+     *
+     * @param <T> State value type.
+     */
+    private static final class State<T> {
+        T value;
+        long version;
+        List<Waker> waiters;
+
+        /**
+         * Constructs initial state holding the starting value and version 1.
+         *
+         * @param value Starting value.
+         */
+        State(T value) {
+            this.value = value;
+            this.version = 1L;
+            this.waiters = new ArrayList<>();
+        }
+    }
+
+    /**
+     * Constructs a Watch channel holding the specified initial value.
+     *
+     * @param initialValue Initial state value.
+     */
+    Watch(T initialValue) {
+        this.inner = new std.sync.Mutex<>(new State<>(initialValue));
+    }
+
+    /**
+     * Factory method creating a new watch channel.
+     *
+     * @param <T> State value type.
+     * @param initialValue Initial state value.
+     * @return New Watch instance.
+     */
+    static <T> Watch<T> channel(T initialValue) {
+        return new Watch<>(initialValue);
+    }
+
+    /**
+     * Borrows the single {@link Sender} handle.
+     *
+     * @return Sender instance.
+     */
+    Sender<T> sender() borrows this {
+        return new Sender<>(this);
+    }
+
+    /**
+     * Creates and returns a new {@link Receiver} initialized to observe changes from the current version.
+     *
+     * @return Receiver instance.
+     */
+    Receiver<T> receiver() borrows this {
+        long ver = 0L;
+        {
+            std.sync.Mutex.Guard<State<T>> guard = this.inner.lock();
+            ver = guard.get().version;
+        }
+        return new Receiver<>(this, ver);
+    }
+
+    /**
+     * Replaces the current watched value and increments the version counter,
+     * awakening all receivers waiting on {@link Receiver#changed()}.
+     *
+     * @param val New state value.
+     */
+    void send(T val) {
+        List<Waker>? toWake = null;
+        {
+            std.sync.Mutex.Guard<State<T>> guard = this.inner.lock();
+            &mut State<T> s = guard.getMut();
+            s.value = val;
+            s.version++;
+            toWake = Objects.replace(&mut s.waiters, new ArrayList<>());
+        }
+        if (toWake != null) {
+            for (int i = 0; i < toWake.size(); i++) {
+                toWake.get(i).wake();
+            }
+        }
+    }
+
+    /**
+     * Inspecting callback for the watched state.
+     *
+     * @param <T> State type.
+     * @param <R> Return type.
+     */
+    interface Func<T, R> {
+        /**
+         * Inspects the watched value reference and computes a result.
+         *
+         * @param value Watched value reference.
+         * @return Computed result.
+         */
+        R apply(&T value);
+    }
+
+    /**
+     * Inspects the latest state value via a reader function while holding the internal lock.
+     *
+     * @param func Inspection callback.
+     * @return Computed result.
+     */
+    <R> R map(Func<T, R> func) {
+        std.sync.Mutex.Guard<State<T>> guard = this.inner.lock();
+        return func.apply(&guard.get().value);
+    }
+
+    /**
+     * Polls whether the watched state has been modified since the caller's last seen version.
+     *
+     * @param lastVersion Last seen state version counter.
+     * @param registered Whether the caller's waker has been enqueued.
+     * @param waker Task waker to awaken on state change.
+     * @return Ready with Unit if modified; Pending otherwise.
+     */
+    Poll<Unit> pollChanged(&mut long lastVersion, &mut boolean registered, &Waker waker) borrows this {
+        std.sync.Mutex.Guard<State<T>> guard = this.inner.lock();
+        &mut State<T> s = guard.getMut();
+        if (s.version > lastVersion) {
+            lastVersion = s.version;
+            return Poll.Ready(new Unit());
+        }
+        if (!registered) {
+            s.waiters.add(waker.copy());
+            registered = true;
+        }
+        return Poll.Pending;
+    }
+}
